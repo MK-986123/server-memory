@@ -63,7 +63,7 @@ Data stays in local databases unless you export it. The default MCP transport is
 ```text
 ┌────────────┐         stdio         ┌─────────────────────┐
 │ MCP client │ ────────────────────> │    server-memory    │
-└────────────┘                       │   FastMCP server     │
+└────────────┘                       │    FastMCP server   │
                                      ├─────────────────────┤
                                      │ Workspace SQLite DB │
                                      │                     │
