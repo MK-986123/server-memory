@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest an improvement for server-memory.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or goal
+      description: What are you trying to achieve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior or API.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Constraints, alternatives considered, or related tools.

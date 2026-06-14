@@ -1,0 +1,65 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.nox/
+.tox/
+.coverage
+.coverage.*
+coverage.xml
+.env
+.env.*
+!.env.example
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# Local data and runtime state
+memory.db
+memory.db-shm
+memory.db-wal
+auth.token
+benchmark/.runtime/
+benchmark/results/*.json
+!benchmark/results/.gitkeep
+
+# Generated packaging metadata
+*.egg-info/
+
+# Local agent/editor state
+.claude/
+.idea
+.idea/
+.vscode
+.vscode/
+.mcp.json
+AGENTS.md
+analysis_report.md
+server_memory_analysis.md
+stdio_proxy.py.bak.*
+RELEASE_SANITIZATION_FINDINGS.md
+security_best_practices_report.md
+server_memory_analysis.md
+*.local.json
+audit-*.json
+pip-audit*.json
+
+# Local shell and user profile artifacts
+.bash_profile
+.bashrc
+.gitconfig
+.gitmodules
+.profile
+.ripgreprc
+.zprofile
+.zshrc
+
+# Git history is intentionally not kept in sanitized publication bundles.
+.git/
+
+# OS/editor clutter
+.DS_Store
+Thumbs.db

@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  quality:
+    name: Quality / Python 3.14 / Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install project and dev tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Validate syntax
+        run: python -m compileall -q src tests scripts
+      - name: Lint
+        run: python -m ruff check .
+      - name: Dependency vulnerability audit
+        run: python -m pip_audit
+
+  test-linux:
+    name: Tests / Python ${{ matrix.python-version }} / Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install project and tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Run tests
+        run: python -m pytest -q
+
+  test-platforms:
+    name: Tests / ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: windows-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.14"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install project and tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Verify SQLite FTS5 support
+        run: python -c "import sqlite3; c=sqlite3.connect(':memory:'); c.execute('CREATE VIRTUAL TABLE t USING fts5(content)'); c.close()"
+      - name: Validate syntax
+        run: python -m compileall -q src tests scripts
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build wheel
+        run: python -m build --wheel
+      - name: Install built wheel
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import subprocess
+          import sys
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", wheels[0]])
+          PY
+      - name: Smoke-test installed package outside checkout
+        working-directory: ${{ runner.temp }}
+        run: python -c "import server_memory; print(server_memory.__version__)"
+      - name: Smoke-test installed MCP stdio entry point
+        run: python scripts/smoke_stdio.py server-memory
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+      - name: Build distributions
+        run: python -m build
+      - name: Check package metadata
+        run: python -m twine check dist/*
+      - name: Install release wheel
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import subprocess
+          import sys
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", wheels[0]])
+          PY
+      - name: Verify installed release package
+        working-directory: ${{ runner.temp }}
+        run: python -c "import server_memory; print(server_memory.__version__)"
+      - name: Smoke-test installed release entry point
+        run: python scripts/smoke_stdio.py server-memory
+      - name: Upload distributions
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@40c09b7dc99638e5ddb0bfd91c1673effc064d8a # v4.8.1
