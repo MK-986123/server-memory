@@ -212,7 +212,7 @@ Report vulnerabilities through GitHub private vulnerability reporting when avail
 
 ## CI and supply chain
 
-GitHub Actions run syntax checks, Ruff, pytest, package build, wheel installation, MCP stdio smoke tests, `pip-audit`, CodeQL, and Dependency Review. Dependabot is configured for Python dependencies and GitHub Actions.
+GitHub Actions are configured to run syntax checks, Ruff, pytest, package build, wheel installation, MCP stdio smoke tests, `pip-audit`, CodeQL, and Dependency Review. Dependabot is configured for Python dependencies and GitHub Actions.
 
 The workflow uses GitHub-hosted `ubuntu-latest`, `windows-latest`, and `macos-latest` labels. GitHub defines those as the latest stable runner images it provides, which can lag the newest vendor OS release during image migrations.
 

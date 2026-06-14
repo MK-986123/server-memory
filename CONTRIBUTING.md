@@ -15,7 +15,6 @@ Optional extras:
 
 ```bash
 python -m pip install -e '.[embeddings]'
-python -m pip install -e '.[desktop-proxy]'
 ```
 
 ## Validation
@@ -29,6 +28,8 @@ python -m pytest
 python -m build
 python -m twine check dist/*
 python -m pip_audit
+python scripts/inspect_wheel.py
+python scripts/smoke_stdio.py
 ```
 
 ## Pull requests

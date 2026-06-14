@@ -288,3 +288,54 @@ async def test_forward_request_forwards_valid_json_response(monkeypatch, tmp_pat
     )
 
     assert outputs == [b'{"jsonrpc":"2.0","id":12,"result":{}}']
+
+
+@pytest.mark.asyncio
+async def test_forward_request_rejects_non_jsonrpc_valid_json(monkeypatch, tmp_path):
+    outputs: list[bytes] = []
+    monkeypatch.setattr(stdio_proxy, "_write_stdout", lambda data: outputs.append(data))
+    monkeypatch.setattr(stdio_proxy, "load_auth_tokens", lambda path: [])
+
+    client = _FakeClient(
+        [
+            _FakeStreamResponse(status_code=200, body=b'{"not_jsonrpc": true}'),
+            _FakeStreamResponse(status_code=200, body=b'[{"jsonrpc":"2.0","result":{}}]'),
+            _FakeStreamResponse(status_code=200, body=b'{"jsonrpc":"2.0","id":12,"result":{},"error":{}}'),
+            _FakeStreamResponse(status_code=200, body=b'{"jsonrpc":"2.0","id":12}'),
+            _FakeStreamResponse(status_code=200, body=b'{"jsonrpc":"2.0","id":12,"error":{"code":"not-int","message":"foo"}}'),
+            _FakeStreamResponse(status_code=200, body=b'{"jsonrpc":"2.0","id":12,"error":{"code":-32000,"message":123}}'),
+        ]
+    )
+
+    for _ in range(6):
+        await stdio_proxy.forward_request(
+            client=client,
+            url="http://127.0.0.1:8765/mcp",
+            msg={"jsonrpc": "2.0", "id": 12, "method": "tools/call"},
+            session_id=None,
+            token_path=tmp_path / "auth.token",
+        )
+
+    # 6 request errors should be emitted
+    assert len(outputs) == 6
+    for out in outputs:
+        payload = json.loads(out.decode("utf-8"))
+        assert payload["jsonrpc"] == "2.0"
+        assert payload["id"] == 12
+        assert payload["error"]["code"] == -32002
+
+    # Now test with notifications (no id)
+    outputs.clear()
+    client_notif = _FakeClient(
+        [
+            _FakeStreamResponse(status_code=200, body=b'{"not_jsonrpc": true}'),
+        ]
+    )
+    await stdio_proxy.forward_request(
+        client=client_notif,
+        url="http://127.0.0.1:8765/mcp",
+        msg={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        session_id=None,
+        token_path=tmp_path / "auth.token",
+    )
+    assert outputs == []

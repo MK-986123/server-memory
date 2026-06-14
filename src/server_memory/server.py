@@ -84,7 +84,11 @@ def _format_memory_context_result(result: dict[str, Any]) -> str:
     """Render compact memory_context output from graph-layer match metadata."""
     lines = []
     if result["pinned"]:
-        pinned_str = ", ".join(f"{p['name']}[{p['type']}]" for p in result["pinned"])
+        pinned_parts = []
+        for p in result["pinned"]:
+            src = f" ({p['source']})" if p.get("source") else ""
+            pinned_parts.append(f"{p['name']}[{p['type']}{src}]")
+        pinned_str = ", ".join(pinned_parts)
         lines.append(f"Pinned: {pinned_str}")
     if result["recent_activity"]:
         acts = [f"{a['action']}:{a['summary']}" for a in result["recent_activity"]]
@@ -92,7 +96,8 @@ def _format_memory_context_result(result: dict[str, Any]) -> str:
     if result["hint_matches"]:
         hint_parts = []
         for h in result["hint_matches"]:
-            part = f"{h['name']}[{h['type']}]"
+            src = f" ({h['source']})" if h.get("source") else ""
+            part = f"{h['name']}[{h['type']}{src}]"
             snippets = h.get("snippets", [])
             if snippets:
                 part += ': "' + '" | "'.join(snippets) + '"'
@@ -155,7 +160,7 @@ def _merge_hint_matches(
     limit: int,
 ) -> list[dict[str, Any]]:
     """Merge hint matches with a slight bias toward workspace-local memory."""
-    merged_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    merged_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     for source, matches in (("workspace", workspace_matches), ("global", global_matches)):
         for match in matches:
@@ -165,7 +170,7 @@ def _merge_hint_matches(
             if source == "workspace":
                 candidate["score"] += WORKSPACE_MEMORY_SCORE_BONUS
 
-            key = (candidate.get("name", ""), candidate.get("type", ""))
+            key = (source, candidate.get("name", ""), candidate.get("type", ""))
             current = merged_by_identity.get(key)
             if current is None or candidate["score"] > float(current.get("score", 0.0)):
                 merged_by_identity[key] = candidate
@@ -186,14 +191,26 @@ def merge_memory_context_results(
 ) -> dict[str, Any]:
     """Merge workspace-local and global preference context into one response."""
     if not global_result:
+        for item in workspace_result.get("pinned", []):
+            item.setdefault("source", "workspace")
+        for item in workspace_result.get("hint_matches", []):
+            item.setdefault("source", "workspace")
         return workspace_result
 
-    pinned_by_identity: dict[tuple[str, str], dict[str, Any]] = {
-        (item.get("name", ""), item.get("type", "")): item
+    # Ensure source is labeled
+    for item in workspace_result.get("pinned", []):
+        item.setdefault("source", "workspace")
+    for item in global_result.get("pinned", []):
+        item.setdefault("source", "global")
+
+    pinned_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {
+        (item.get("source", "workspace"), item.get("name", ""), item.get("type", "")): item
         for item in workspace_result.get("pinned", [])
     }
     for item in global_result.get("pinned", []):
-        pinned_by_identity.setdefault((item.get("name", ""), item.get("type", "")), item)
+        pinned_by_identity.setdefault(
+            (item.get("source", "global"), item.get("name", ""), item.get("type", "")), item
+        )
 
     workspace_stats = workspace_result.get("stats", {})
     global_stats = global_result.get("stats", {})
@@ -253,14 +270,29 @@ def _source_wrapped(source: str, payload: Any) -> dict[str, Any]:
     return {"source": source, "result": payload}
 
 
-def _close_lifespan_databases(db: Database | None, global_db: Database | None) -> None:
-    """Close lifespan databases using try/finally so both are always closed, preserving exceptions."""
+def _safe_close_db(database: Database | None, has_active_exc: bool) -> None:
+    if database is None:
+        return
     try:
-        if db is not None:
-            db.close()
-    finally:
+        database.close()
+    except Exception as exc:
+        if has_active_exc:
+            logger.error("Suppressing database close error because another exception is active: %s", exc)
+        else:
+            raise
+
+
+def _close_lifespan_databases(db: Database | None, global_db: Database | None) -> None:
+    """Close lifespan databases safely, ensuring both are closed and exceptions are handled correctly."""
+    import sys
+    has_active_exc = sys.exc_info()[1] is not None
+    try:
         if global_db is not None:
-            global_db.close()
+            _safe_close_db(global_db, has_active_exc)
+    finally:
+        has_active_exc_now = has_active_exc or (sys.exc_info()[1] is not None)
+        if db is not None:
+            _safe_close_db(db, has_active_exc_now)
 
 
 def create_server(
@@ -287,50 +319,51 @@ def create_server(
         db.open()
 
         global_db: Database | None = None
-        global_graph_mgr: KnowledgeGraphManager | None = None
-        use_global_db = cfg.global_db_enabled and cfg.global_db_path != cfg.db_path
-        if use_global_db:
-            cfg.ensure_global_db_dir()
-            global_db = Database(cfg.global_db_path)
-            global_db.open()
+        try:
+            global_graph_mgr: KnowledgeGraphManager | None = None
+            use_global_db = cfg.global_db_enabled and cfg.global_db_path != cfg.db_path
+            if use_global_db:
+                cfg.ensure_global_db_dir()
+                g_db = Database(cfg.global_db_path)
+                g_db.open()
+                global_db = g_db
 
-        # Create embedding engine if enabled
-        embedding_engine: EmbeddingEngine | None = None
-        if cfg.embedding_enabled:
-            embedding_engine = EmbeddingEngine(model_name=cfg.embedding_model)
+            # Create embedding engine if enabled
+            embedding_engine: EmbeddingEngine | None = None
+            if cfg.embedding_enabled:
+                embedding_engine = EmbeddingEngine(model_name=cfg.embedding_model)
 
-        graph_mgr = KnowledgeGraphManager(
-            db,
-            session_id=cfg.session_id or "",
-            embedding_engine=embedding_engine,
-            project=cfg.project,
-            dedup_threshold=cfg.dedup_threshold,
-            write_embedding_budget_ms=cfg.write_embedding_budget_ms,
-        )
-
-        if global_db is not None:
-            global_graph_mgr = KnowledgeGraphManager(
-                global_db,
+            graph_mgr = KnowledgeGraphManager(
+                db,
                 session_id=cfg.session_id or "",
                 embedding_engine=embedding_engine,
-                project="",
+                project=cfg.project,
                 dedup_threshold=cfg.dedup_threshold,
                 write_embedding_budget_ms=cfg.write_embedding_budget_ms,
             )
 
-        # Import from old server if requested
-        if cfg.import_jsonl:
-            try:
-                with open(cfg.import_jsonl) as f:
-                    data = f.read()
-                counts = graph_mgr.import_graph(data)
-                logger.info("Imported from JSONL: %s", counts)
-            except Exception as e:
-                logger.error("Failed to import JSONL: %s", e)
+            if global_db is not None:
+                global_graph_mgr = KnowledgeGraphManager(
+                    global_db,
+                    session_id=cfg.session_id or "",
+                    embedding_engine=embedding_engine,
+                    project="",
+                    dedup_threshold=cfg.dedup_threshold,
+                    write_embedding_budget_ms=cfg.write_embedding_budget_ms,
+                )
 
-        _schedule_startup_cleanup(cfg)
+            # Import from old server if requested
+            if cfg.import_jsonl:
+                try:
+                    with open(cfg.import_jsonl) as f:
+                        data = f.read()
+                    counts = graph_mgr.import_graph(data)
+                    logger.info("Imported from JSONL: %s", counts)
+                except Exception as e:
+                    logger.error("Failed to import JSONL: %s", e)
 
-        try:
+            _schedule_startup_cleanup(cfg)
+
             yield {
                 "db": db,
                 "graph": graph_mgr,
@@ -729,15 +762,21 @@ def create_server(
         graph_mgr, cfg, global_graph_mgr = _get_ctx(ctx)
         normalized_scope = _normalize_scope(scope)
         if normalized_scope == "workspace":
-            return _format_memory_context_result(
-                graph_mgr.memory_context(hint=hint, project=project, limit=limit)
-            )
+            res = graph_mgr.memory_context(hint=hint, project=project, limit=limit)
+            for item in res.get("pinned", []):
+                item.setdefault("source", "workspace")
+            for item in res.get("hint_matches", []):
+                item.setdefault("source", "workspace")
+            return _format_memory_context_result(res)
         if normalized_scope == "global":
             if global_graph_mgr is None:
                 return _scope_error(scope)
-            return _format_memory_context_result(
-                global_graph_mgr.memory_context(hint=hint, project="", limit=limit)
-            )
+            res = global_graph_mgr.memory_context(hint=hint, project="", limit=limit)
+            for item in res.get("pinned", []):
+                item.setdefault("source", "global")
+            for item in res.get("hint_matches", []):
+                item.setdefault("source", "global")
+            return _format_memory_context_result(res)
         workspace_result = graph_mgr.memory_context(hint=hint, project=project, limit=limit)
         global_result = None
         if global_graph_mgr is not None:
@@ -1183,14 +1222,20 @@ def create_server(
                 kg.relations.append(r)
 
         if normalized_scope == "all" and global_graph_mgr is not None:
+            for entity in kg.entities:
+                if "workspace" not in entity.tags:
+                    entity.tags = list(entity.tags) + ["workspace"]
+
             global_kg = global_graph_mgr.read_graph(tags=["pinned", PREFERENCE_TAG], limit=20)
-            existing_names = {e.name.lower() for e in kg.entities}
+            existing_global_names = set()
             id_offset = 100_000_000
             for entity in global_kg.entities:
-                if entity.name.lower() not in existing_names:
+                if entity.name.lower() not in existing_global_names:
                     entity.id += id_offset
+                    if "global" not in entity.tags:
+                        entity.tags = list(entity.tags) + ["global"]
                     kg.entities.append(entity)
-                    existing_names.add(entity.name.lower())
+                    existing_global_names.add(entity.name.lower())
             kg.relations.extend(global_kg.relations)
 
         pinned_ids = _get_pinned_ids(graph_mgr)

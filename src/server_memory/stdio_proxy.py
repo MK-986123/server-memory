@@ -79,8 +79,60 @@ def _write_stdout(data: bytes) -> None:
             written += os.write(fd, payload[written:])
 
 
+def _is_valid_single_jsonrpc_msg(item: Any) -> bool:
+    """Validate a single JSON-RPC 2.0 item."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("jsonrpc") != "2.0":
+        return False
+
+    has_method = "method" in item
+    has_result = "result" in item
+    has_error = "error" in item
+
+    if has_method:
+        # Request or Notification
+        if not isinstance(item["method"], str):
+            return False
+        if "id" in item:
+            req_id = item["id"]
+            if req_id is not None and not isinstance(req_id, (str, int, float)):
+                return False
+        return True
+
+    # Response or Error
+    if (has_result and has_error) or (not has_result and not has_error):
+        return False
+
+    if "id" not in item:
+        return False
+    resp_id = item["id"]
+    if resp_id is not None and not isinstance(resp_id, (str, int, float)):
+        return False
+
+    if has_error:
+        err = item["error"]
+        if not isinstance(err, dict):
+            return False
+        if not isinstance(err.get("code"), int):
+            return False
+        if not isinstance(err.get("message"), str):
+            return False
+
+    return True
+
+
+def _is_valid_jsonrpc_msg(msg: Any) -> bool:
+    """Return True if msg matches a valid JSON-RPC 2.0 structure (single or batch)."""
+    if isinstance(msg, list):
+        if not msg:
+            return False
+        return all(_is_valid_single_jsonrpc_msg(item) for item in msg)
+    return _is_valid_single_jsonrpc_msg(msg)
+
+
 def _validated_json_payload(data: bytes | str) -> bytes | None:
-    """Return canonical JSON bytes for valid JSON values, otherwise None."""
+    """Return canonical JSON bytes for valid JSON-RPC 2.0 messages, otherwise None."""
     if isinstance(data, bytes):
         stripped = data.strip()
         if not stripped:
@@ -97,6 +149,10 @@ def _validated_json_payload(data: bytes | str) -> bytes | None:
             parsed = json.loads(stripped_text)
         except json.JSONDecodeError:
             return None
+
+    if not _is_valid_jsonrpc_msg(parsed):
+        return None
+
     return json.dumps(parsed, separators=(",", ":")).encode("utf-8")
 
 

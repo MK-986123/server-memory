@@ -991,7 +991,7 @@ def test_lifespan_database_cleanup_closes_both_databases_when_one_close_fails():
     global_db = FakeDatabase("global")
     with pytest.raises(RuntimeError, match="workspace close failed"):
         server_module._close_lifespan_databases(workspace_db, global_db)
-    assert calls == ["workspace", "global"]
+    assert calls == ["global", "workspace"]
 
     # Global close fails
     calls.clear()
@@ -999,15 +999,106 @@ def test_lifespan_database_cleanup_closes_both_databases_when_one_close_fails():
     global_db2 = FakeDatabase("global", fail=True)
     with pytest.raises(RuntimeError, match="global close failed"):
         server_module._close_lifespan_databases(workspace_db2, global_db2)
-    assert calls == ["workspace", "global"]
+    assert calls == ["global", "workspace"]
 
-    # Both close fail
+    # Both close fail - workspace close exception is suppressed, raising global close failed
     calls.clear()
     workspace_db3 = FakeDatabase("workspace", fail=True)
     global_db3 = FakeDatabase("global", fail=True)
     with pytest.raises(RuntimeError, match="global close failed"):
         server_module._close_lifespan_databases(workspace_db3, global_db3)
-    assert calls == ["workspace", "global"]
+    assert calls == ["global", "workspace"]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_exception_safety_scenarios(monkeypatch, tmp_path):
+    monkeypatch.setattr(server_module, "_startup_cleanup_started", True)
+    # Test global DB open failure
+    config_global_fail = MemoryConfig(
+        db_path=tmp_path / "workspace.db",
+        global_db_path=tmp_path / "global_fail.db",
+        global_db_enabled=True,
+    )
+    
+    workspace_opens = 0
+    workspace_closes = 0
+    global_opens = 0
+    global_closes = 0
+    
+    class MockDatabase:
+        def __init__(self, path):
+            self.path = path
+            
+        def open(self):
+            nonlocal workspace_opens, global_opens
+            if "global_fail.db" in str(self.path):
+                global_opens += 1
+                raise RuntimeError("Global DB open failed")
+            elif "global_emb_fail.db" in str(self.path):
+                global_opens += 1
+            else:
+                workspace_opens += 1
+                
+        def close(self):
+            nonlocal workspace_closes, global_closes
+            if "global_fail.db" in str(self.path) or "global_emb_fail.db" in str(self.path):
+                global_closes += 1
+            else:
+                workspace_closes += 1
+
+    monkeypatch.setattr(server_module, "Database", MockDatabase)
+    
+    server = server_module.create_server(config_global_fail)
+    
+    # Run lifespan and assert workspace DB is closed even when global DB open fails
+    with pytest.raises(RuntimeError, match="Global DB open failed"):
+        async with server.settings.lifespan(server):
+            pass
+            
+    assert workspace_opens == 1
+    assert workspace_closes == 1
+    assert global_opens == 1
+    assert global_closes == 0
+
+    # Test embedding initialization failure
+    monkeypatch.setattr(server_module, "EmbeddingEngine", lambda model_name: exec("raise(RuntimeError('Embedding init failed'))"))
+    config_emb_fail = MemoryConfig(
+        db_path=tmp_path / "workspace.db",
+        global_db_path=tmp_path / "global_emb_fail.db",
+        global_db_enabled=True,
+        embedding_enabled=True,
+    )
+    workspace_opens = 0
+    workspace_closes = 0
+    global_opens = 0
+    global_closes = 0
+    
+    server2 = server_module.create_server(config_emb_fail)
+    with pytest.raises(RuntimeError, match="Embedding init failed"):
+        async with server2.settings.lifespan(server2):
+            pass
+            
+    assert workspace_opens == 1
+    assert workspace_closes == 1
+    assert global_opens == 1
+    assert global_closes == 1
+
+    # Test body exception with database closures
+    workspace_opens = 0
+    workspace_closes = 0
+    global_opens = 0
+    global_closes = 0
+    monkeypatch.setattr(server_module, "EmbeddingEngine", lambda model_name: None)
+    
+    server3 = server_module.create_server(config_emb_fail)
+    with pytest.raises(RuntimeError, match="Body failure"):
+        async with server3.settings.lifespan(server3):
+            raise RuntimeError("Body failure")
+            
+    assert workspace_opens == 1
+    assert workspace_closes == 1
+    assert global_opens == 1
+    assert global_closes == 1
 
 
 def test_destructive_operations_prevent_scope_all(tmp_path):
@@ -1081,6 +1172,45 @@ def test_memory_context_full_shifts_global_ids(tmp_path):
         assert "Workspace Pinned" in entity_names
         # Both must be present! (The fix ensures the global pinned entity is not skipped due to ID collision)
         assert "Global Pinned" in entity_names
+    finally:
+        global_db.close()
+        workspace_db.close()
+
+
+def test_mcp_scope_all_same_named_entities_collision(tmp_path):
+    workspace_db = Database(tmp_path / "workspace.db")
+    global_db = Database(tmp_path / "global.db")
+    workspace_db.open()
+    global_db.open()
+    try:
+        workspace_graph = KnowledgeGraphManager(workspace_db, session_id="workspace")
+        global_graph = KnowledgeGraphManager(global_db, session_id="global")
+        
+        # Add same-named entities
+        workspace_graph.create_entities([
+            {"name": "App Settings", "entityType": "config", "tags": ["pinned"], "observations": ["workspace setting"]}
+        ])
+        global_graph.create_entities([
+            {"name": "App Settings", "entityType": "config", "tags": ["pinned"], "observations": ["global setting"]}
+        ])
+        
+        config = MemoryConfig(
+            db_path=tmp_path / "workspace.db",
+            global_db_path=tmp_path / "global.db",
+            embedding_enabled=False,
+        )
+        ctx = _tool_ctx(workspace_graph, config, global_graph)
+        
+        # Test memory_context tool with scope="all"
+        context_res = _tool_fn("memory_context")(ctx, hint="setting", scope="all")
+        assert "App Settings[config (workspace)]" in context_res
+        assert "App Settings[config (global)]" in context_res
+        
+        # Test memory_context_full tool with scope="all"
+        full_res = _tool_fn("memory_context_full")(ctx, scope="all", budget=10000)
+        assert "App Settings [config]" in full_res
+        assert "#workspace" in full_res
+        assert "#global" in full_res
     finally:
         global_db.close()
         workspace_db.close()
