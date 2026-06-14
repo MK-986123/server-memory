@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.nox/
+.tox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+.env
+.env.*
+!.env.example
+
+build/
+dist/
+.venv/
+venv/
+*.egg-info/
+
+# Local databases and runtime state
+*.db
+*.db-shm
+*.db-wal
+auth.token
+*.log
+
+# Editor and OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
