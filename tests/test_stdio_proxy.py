@@ -339,3 +339,39 @@ async def test_forward_request_rejects_non_jsonrpc_valid_json(monkeypatch, tmp_p
         token_path=tmp_path / "auth.token",
     )
     assert outputs == []
+
+
+def test_strict_jsonrpc_validation():
+    # ID validations
+    assert stdio_proxy._is_valid_id(None) is True
+    assert stdio_proxy._is_valid_id("id-123") is True
+    assert stdio_proxy._is_valid_id(123) is True
+    assert stdio_proxy._is_valid_id(12.3) is True
+    assert stdio_proxy._is_valid_id(True) is False
+    assert stdio_proxy._is_valid_id(False) is False
+
+    # Single message validation
+    # Params must be structured (dict or list)
+    assert stdio_proxy._is_valid_single_jsonrpc_msg(
+        {"jsonrpc": "2.0", "method": "foo", "params": "invalid_string"}
+    ) is False
+    assert stdio_proxy._is_valid_single_jsonrpc_msg(
+        {"jsonrpc": "2.0", "method": "foo", "params": []}
+    ) is True
+    assert stdio_proxy._is_valid_single_jsonrpc_msg(
+        {"jsonrpc": "2.0", "method": "foo", "params": {}}
+    ) is True
+
+    # Error code cannot be bool
+    assert stdio_proxy._is_valid_single_jsonrpc_msg(
+        {"jsonrpc": "2.0", "id": 123, "error": {"code": True, "message": "msg"}}
+    ) is False
+    assert stdio_proxy._is_valid_single_jsonrpc_msg(
+        {"jsonrpc": "2.0", "id": 123, "error": {"code": -32600, "message": "msg"}}
+    ) is True
+
+    # ID in response cannot be bool
+    assert stdio_proxy._is_valid_single_jsonrpc_msg(
+        {"jsonrpc": "2.0", "id": True, "result": {}}
+    ) is False
+

@@ -205,13 +205,17 @@ class Database:
         self.conn: sqlite3.Connection | None = None
 
     def open(self) -> None:
-        self.conn = sqlite3.connect(
-            self.db_path,
-            timeout=self.CONNECT_TIMEOUT_SECONDS,
-        )
-        self.conn.row_factory = sqlite3.Row
-        self._configure()
-        self._init_schema()
+        try:
+            self.conn = sqlite3.connect(
+                self.db_path,
+                timeout=self.CONNECT_TIMEOUT_SECONDS,
+            )
+            self.conn.row_factory = sqlite3.Row
+            self._configure()
+            self._init_schema()
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         if self.conn:

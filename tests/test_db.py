@@ -2,6 +2,8 @@
 
 import sqlite3
 
+import pytest
+
 from server_memory.db import SCHEMA_VERSION, SYSTEM_TAGS, Database
 
 
@@ -210,3 +212,20 @@ def test_embedding_table_foreign_key(db):
         "SELECT COUNT(*) c FROM entity_embeddings WHERE entity_id = ?", (eid,)
     ).fetchone()
     assert row["c"] == 0
+
+
+def test_database_open_self_cleaning_on_failure(monkeypatch, tmp_path):
+    """Database.open should close the sqlite connection if configuration or schema fails."""
+    db = Database(tmp_path / "fail.db")
+
+    # Mock _configure to raise an error
+    def mock_configure():
+        raise RuntimeError("Config failure")
+
+    monkeypatch.setattr(db, "_configure", mock_configure)
+
+    with pytest.raises(RuntimeError, match="Config failure"):
+        db.open()
+
+    # Connection should be closed and set to None
+    assert db.conn is None

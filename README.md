@@ -60,7 +60,6 @@ Optional extras:
 
 ```bash
 python -m pip install -e ".[embeddings]"
-python -m pip install -e ".[desktop-proxy]"
 ```
 
 ## Quick start

@@ -49,18 +49,41 @@ def load_auth_tokens(token_path: str | os.PathLike[str] | None = None) -> list[s
     return read_local_auth_tokens(resolved_path)
 
 
-def _has_request_id(msg: dict[str, Any]) -> bool:
-    return "id" in msg and msg.get("id") is not None
+def _is_valid_id(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, str)
+        or (isinstance(value, (int, float)) and not isinstance(value, bool))
+    )
 
 
-def _jsonrpc_error(msg: dict[str, Any], code: int, message: str) -> bytes | None:
-    """Build a JSON-RPC error only for requests; notifications get no output."""
-    if not _has_request_id(msg):
+def _jsonrpc_error(msg: Any, code: int, message: str) -> bytes | None:
+    """Build a JSON-RPC error response. Returns bytes, or None if no response is needed (e.g. notifications only)."""
+    if isinstance(msg, list):
+        batch_errors = []
+        for item in msg:
+            if isinstance(item, dict) and "id" in item:
+                req_id = item["id"]
+                if _is_valid_id(req_id):
+                    batch_errors.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {"code": code, "message": message},
+                        }
+                    )
+        if not batch_errors:
+            return None
+        return json.dumps(batch_errors, separators=(",", ":")).encode("utf-8")
+
+    if not isinstance(msg, dict) or "id" not in msg:
+        return None
+    req_id = msg["id"]
+    if not _is_valid_id(req_id):
         return None
     return json.dumps(
         {
             "jsonrpc": "2.0",
-            "id": msg.get("id"),
+            "id": req_id,
             "error": {"code": code, "message": message},
         },
         separators=(",", ":"),
@@ -90,13 +113,16 @@ def _is_valid_single_jsonrpc_msg(item: Any) -> bool:
     has_result = "result" in item
     has_error = "error" in item
 
+    if "params" in item and not isinstance(item["params"], (dict, list)):
+        return False
+
     if has_method:
         # Request or Notification
         if not isinstance(item["method"], str):
             return False
         if "id" in item:
             req_id = item["id"]
-            if req_id is not None and not isinstance(req_id, (str, int, float)):
+            if not _is_valid_id(req_id):
                 return False
         return True
 
@@ -107,14 +133,15 @@ def _is_valid_single_jsonrpc_msg(item: Any) -> bool:
     if "id" not in item:
         return False
     resp_id = item["id"]
-    if resp_id is not None and not isinstance(resp_id, (str, int, float)):
+    if not _is_valid_id(resp_id):
         return False
 
     if has_error:
         err = item["error"]
         if not isinstance(err, dict):
             return False
-        if not isinstance(err.get("code"), int):
+        code = err.get("code")
+        if not isinstance(code, int) or isinstance(code, bool):
             return False
         if not isinstance(err.get("message"), str):
             return False
@@ -283,8 +310,38 @@ async def proxy(url: str) -> None:
                 try:
                     msg = json.loads(line)
                 except json.JSONDecodeError:
+                    _write_stdout(
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": None,
+                                "error": {"code": -32700, "message": "Parse error"},
+                            },
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
                     continue
-                if isinstance(msg, dict):
+
+                if not _is_valid_jsonrpc_msg(msg):
+                    # Extract id if valid
+                    req_id = None
+                    if isinstance(msg, dict):
+                        possible_id = msg.get("id")
+                        if _is_valid_id(possible_id):
+                            req_id = possible_id
+                    _write_stdout(
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "error": {"code": -32600, "message": "Invalid Request"},
+                            },
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                    continue
+
+                if isinstance(msg, (dict, list)):
                     session_id = await forward_request(client, url, msg, session_id, token_path)
 
 
