@@ -19,6 +19,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#tool-reference">Tools</a> ·
   <a href="#evaluation">Evaluation</a> ·
+  <a href="#local-validation">Validation</a> ·
   <a href="#security-and-privacy">Security</a>
 </p>
 
@@ -36,7 +37,7 @@ Data remains local unless it is explicitly exported. The default transport is st
 
 ## Why server-memory
 
-LLM agents commonly lose useful state between sessions. The usual workarounds have real costs:
+LLM agents commonly lose useful state between sessions. Common workarounds have real costs:
 
 - repeating repository discovery and diagnostics
 - pasting large handoff summaries into every new session
@@ -80,7 +81,7 @@ Routine recall uses `memory_context`:
 4. Suppress duplicate or low-value matches.
 5. Return bounded snippets plus conflict and stale-state indicators.
 
-The goal is to return the smallest useful memory slice for the current task, not to place the entire database in the model context.
+The goal is to return the smallest useful memory slice for the current task, not to place the entire database in model context.
 
 ### At a glance
 
@@ -146,9 +147,15 @@ Use shared mode when multiple local clients should access one database process r
 
 - Python 3.10 or newer
 - SQLite with FTS5 enabled
-- macOS, Ubuntu, or Windows for the tested GitHub Actions support matrix
+- Git and `pip` for installation from the repository
 
-The CI workflow tests Python 3.10 through 3.14 on Ubuntu and selected Python versions on Ubuntu, Windows, and macOS.
+Check FTS5 support:
+
+```bash
+python -c "import sqlite3; c=sqlite3.connect(':memory:'); c.execute('CREATE VIRTUAL TABLE t USING fts5(content)'); c.close(); print('FTS5 available')"
+```
+
+No hosted CI status is used as proof of compatibility. Validate the package locally on the operating system and Python version where it will run.
 
 ## Installation
 
@@ -189,6 +196,8 @@ Install development and embedding dependencies together:
 ```bash
 python -m pip install -e ".[dev,embeddings]"
 ```
+
+AI coding agents working in this repository should follow [`AGENTS.md`](AGENTS.md). Contributors should also read [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Quick start
 
@@ -387,7 +396,9 @@ The protocol measures:
 > [!NOTE]
 > No performance numbers are claimed in this README yet. Verified results should include raw run records, exact model revisions, repository commits, configurations, task fixtures, evaluator rubrics, acceptance-test logs, and confidence intervals.
 
-## Development
+## Local validation
+
+Hosted GitHub Actions are not currently treated as an active validation source for this repository. Workflow definitions may remain under `.github/workflows` for future use, but this README does not claim that those jobs are running or passing.
 
 Install development dependencies:
 
@@ -395,29 +406,38 @@ Install development dependencies:
 python -m pip install -e ".[dev]"
 ```
 
-Run the local validation sequence:
+Run the required local checks:
 
 ```bash
 python -m compileall -q src tests scripts
 python -m ruff check .
 python -m pytest -q
+```
+
+Run the full package and supply-chain checks before a release or substantial pull request:
+
+```bash
+rm -rf dist build
 python -m build
 python -m twine check dist/*
 python scripts/inspect_wheel.py dist
 python -m pip_audit
-```
-
-Verify installed entry points:
-
-```bash
 python scripts/smoke_stdio.py server-memory
 server-memory-serve --help
 server-memory-proxy --help
 ```
 
+On PowerShell, remove build artifacts with:
+
+```powershell
+Remove-Item -Recurse -Force dist, build -ErrorAction SilentlyContinue
+```
+
 The stdio smoke test sends an MCP `initialize` request to the installed entry point and fails if stdout contains non-protocol output.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
+When reporting validation, include the exact commands, Python version, operating system, and full failure output. Do not describe a check as passing unless it was actually executed.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution guidance and [`AGENTS.md`](AGENTS.md) for repository-specific agent instructions.
 
 ## Security and privacy
 
@@ -434,26 +454,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
 
 Report vulnerabilities through GitHub private vulnerability reporting when available. Do not include secrets or private memory exports in public issues.
 
-See [SECURITY.md](SECURITY.md) for the project security policy.
-
-## CI and supply chain
-
-GitHub Actions are configured to run:
-
-- syntax validation
-- Ruff linting
-- pytest across the supported Python and operating-system matrix
-- wheel and source-distribution builds
-- wheel-content inspection
-- clean installed-package checks outside the repository checkout
-- MCP stdio and installed-command smoke tests
-- `pip-audit`
-- CodeQL
-- Dependency Review
-
-Dependabot is configured for Python dependencies and GitHub Actions.
-
-The workflow uses GitHub-hosted `ubuntu-latest`, `windows-latest`, and `macos-latest` labels. These labels refer to GitHub's latest stable runner images and can temporarily lag the newest vendor operating-system release during image migrations.
+See [`SECURITY.md`](SECURITY.md) for the project security policy.
 
 ## Troubleshooting
 
