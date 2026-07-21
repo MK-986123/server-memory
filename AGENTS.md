@@ -68,6 +68,8 @@ Do not commit `.tmp`, SQLite databases, exports, backups, token files, model cac
 - Preserve public tool names, parameter shapes, scope semantics, and JSON-RPC behavior unless the task explicitly requires a breaking change.
 - Keep stdio stdout protocol-clean. Send diagnostics to stderr or logging.
 - Keep destructive operations explicit and scoped. Do not weaken rejection of `scope="all"` for destructive tools.
+- Prefer soft-delete defaults for entities; preserve `list_deleted_entities` and `restore_entities`. Hard delete must remain explicit.
+- Schema migrations run on database open. Keep DDL and migration order safe for existing schema v4 production databases; never create indexes on columns that migrations have not added yet.
 - Do not add performance claims without reproducible raw results.
 
 ## Required validation
