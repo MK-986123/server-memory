@@ -103,11 +103,23 @@ class Database(_impl.Database):
                 for table in SNAPSHOT_TABLES
                 if table != "tags"
             )
-            populated = populated or bool(
-                self.cx.execute(
-                    "SELECT EXISTS(SELECT 1 FROM tags WHERE is_system = 0) AS used"
-                ).fetchone()["used"]
-            )
+            seeded_tags = {
+                (name, description, color, int(is_system), auto_expire_hours)
+                for name, description, color, is_system, auto_expire_hours in SYSTEM_TAGS
+            }
+            actual_tags = {
+                (
+                    row["name"],
+                    row["description"],
+                    row["color"],
+                    row["is_system"],
+                    row["auto_expire_hours"],
+                )
+                for row in self.cx.execute(
+                    "SELECT name, description, color, is_system, auto_expire_hours FROM tags"
+                )
+            }
+            populated = populated or not actual_tags.issubset(seeded_tags)
             if populated:
                 raise ValueError("snapshot conflict: target store is not empty")
 
