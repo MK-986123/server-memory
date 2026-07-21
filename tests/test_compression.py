@@ -2,6 +2,8 @@
 
 from server_memory.compression import (
     CompressionLevel,
+    _enforce_budget,
+    _estimate_tokens,
     compress_graph,
     format_entity_heavy,
     format_entity_light,
@@ -76,6 +78,22 @@ def test_format_relation_heavy():
     assert format_relation_heavy(r) == "A>B"
 
 
+def test_text_formats_namespace_merged_scope_identity():
+    workspace = _make_entity("Shared", "note", ["workspace fact"])
+    workspace.scope = "workspace"
+    global_entity = _make_entity("Shared", "note", ["global fact"])
+    global_entity.scope = "global"
+    relation = _make_relation("Shared", "Other", "uses")
+    relation.scope = "global"
+
+    graph = KnowledgeGraph(entities=[workspace, global_entity], relations=[relation])
+    rendered = compress_graph(graph, CompressionLevel.MEDIUM, token_budget=2000)
+
+    assert "Shared@workspace" in rendered
+    assert "Shared@global" in rendered
+    assert "Shared@global>uses>Other@global" in rendered
+
+
 def test_compress_graph_medium():
     kg = KnowledgeGraph(
         entities=[
@@ -120,3 +138,56 @@ def test_compress_graph_none_level():
     )
     result = compress_graph(kg, CompressionLevel.NONE, token_budget=2000)
     assert '"entities"' in result or '"name"' in result  # Should be JSON
+
+
+def test_budget_includes_omission_footer_and_pinned_overflow():
+    pinned = _make_entity("Pinned", "decision", ["critical detail " * 100], ["pinned"])
+    pinned.id = 1
+    graph = KnowledgeGraph(
+        entities=[pinned, *[_make_entity(f"Other{i}", "note", ["fact " * 20]) for i in range(20)]],
+        relations=[],
+    )
+
+    output = compress_graph(
+        graph,
+        CompressionLevel.AUTO,
+        token_budget=40,
+        pinned_entity_ids={1},
+    )
+
+    assert _estimate_tokens(output) <= 40
+    assert "Pinned" in output
+
+
+def test_auto_keeps_at_least_as_many_entities_as_best_fixed_layout():
+    entities = [_make_entity(f"Entity{i}", "note", [f"important fact {i}"]) for i in range(20)]
+    graph = KnowledgeGraph(entities=entities, relations=[])
+
+    fixed = [
+        compress_graph(graph, level, token_budget=60)
+        for level in (CompressionLevel.LIGHT, CompressionLevel.MEDIUM, CompressionLevel.HEAVY)
+    ]
+    auto = compress_graph(graph, CompressionLevel.AUTO, token_budget=60)
+    def retained(output: str) -> int:
+        return sum(entity.name in output for entity in entities)
+
+    assert _estimate_tokens(auto) <= 60
+    assert retained(auto) >= max(retained(output) for output in fixed)
+
+
+def test_unicode_cannot_bypass_token_budget_estimate():
+    adversarial = "👩🏽‍💻🧠漢字" * 40
+
+    output = _enforce_budget(adversarial, 40)
+
+    assert _estimate_tokens(output) <= 40
+    assert len(output) < len(adversarial) // 4
+
+
+def test_punctuation_heavy_ascii_cannot_bypass_token_budget():
+    adversarial = "! @ # $ % ^ & * ( ) " * 40
+
+    output = _enforce_budget(adversarial, 25)
+
+    assert _estimate_tokens(output) <= 25
+    assert len(output) < len(adversarial) // 2

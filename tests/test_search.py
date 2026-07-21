@@ -53,6 +53,19 @@ def test_fuzzy_search_fallback(graph):
     assert "authentication" in names
 
 
+def test_fts_failure_is_diagnostic_and_falls_back(graph, caplog):
+    graph.create_entities(
+        [{"name": "Authentication", "entityType": "module", "observations": ["login flow"]}]
+    )
+    graph.db.cx.execute("DROP TABLE fts_entities")
+
+    kg = graph.search_fts("Authentication")
+
+    assert [entity.name for entity in kg.entities] == ["Authentication"]
+    assert "entity_fts_fallback" in graph.last_search_diagnostics
+    assert "Entity FTS unavailable" in caplog.text
+
+
 def test_search_filter_by_tags(graph):
     graph.create_entities(
         [
@@ -142,6 +155,16 @@ def test_search_includes_relations(graph):
     graph.create_relations([{"from": "Server", "to": "Database", "relationType": "uses"}])
     kg = graph.search_fts("HTTP")
     assert len(kg.relations) > 0
+
+
+def test_unlimited_search_supports_pagination_beyond_legacy_500_cap(graph):
+    graph.create_entities(
+        [{"name": f"Match Entity {index}", "entityType": "note"} for index in range(600)]
+    )
+
+    kg = graph.search_fts("Match", limit=0)
+
+    assert len(kg.entities) == 600
 
 
 def test_search_fts_prefers_exact_entity_name_hit(graph):

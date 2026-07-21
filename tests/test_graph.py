@@ -125,7 +125,6 @@ def test_create_entities_raises_when_database_is_locked():
 
     blocked_db = Database(db_path)
     blocked_db.open()
-    blocked_db.cx.execute("PRAGMA busy_timeout=50")
     locker = sqlite3.connect(db_path, check_same_thread=False)
     locker.execute("BEGIN EXCLUSIVE")
     try:
@@ -475,6 +474,21 @@ def test_restore_entity(graph):
     assert count == 1
     kg = graph.read_graph()
     assert any(e.name == "Restore" for e in kg.entities)
+
+
+def test_list_deleted_entities_supports_recovery(graph):
+    graph.create_entities(
+        [
+            {"name": "Recover First", "entityType": "test"},
+            {"name": "Recover Second", "entityType": "test"},
+        ]
+    )
+    graph.delete_entities(["Recover First", "Recover Second"])
+
+    deleted = graph.list_deleted_entities(limit=10)
+
+    assert [entity.name for entity in deleted] == ["Recover Second", "Recover First"]
+    assert all(entity.deleted_at is not None for entity in deleted)
 
 
 def test_create_relations(graph):
