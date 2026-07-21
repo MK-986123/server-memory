@@ -421,9 +421,11 @@ def test_write_lock_exceeding_deadline_raises_database_busy(tmp_path):
     locker = sqlite3.connect(db_path, check_same_thread=False)
     locker.execute("BEGIN EXCLUSIVE")
     try:
-        with pytest.raises(DatabaseBusyError) as exc_info:
-            with db.transaction() as cx:
-                cx.execute("INSERT INTO entities (name, entity_type) VALUES ('blocked', 'note')")
+        with (
+            pytest.raises(DatabaseBusyError) as exc_info,
+            db.transaction() as cx,
+        ):
+            cx.execute("INSERT INTO entities (name, entity_type) VALUES ('blocked', 'note')")
         assert exc_info.value.retryable is True
         assert "0.35" in str(exc_info.value)
     finally:

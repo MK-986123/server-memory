@@ -5,7 +5,6 @@ import sys
 
 import pytest
 
-from server_memory import compression as compression_module
 from server_memory.compression import (
     CompressionLevel,
     _approximate_tokens,
