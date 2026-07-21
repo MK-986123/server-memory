@@ -464,6 +464,24 @@ def test_soft_delete_entity(graph):
     assert any(e.name == "ToDelete" for e in kg.entities)
 
 
+def test_create_entities_rejects_soft_deleted_name_with_actionable_error(graph):
+    graph.create_entities([{"name": "Recycle", "entityType": "test"}])
+    graph.delete_entities(["Recycle"], hard=False)
+
+    try:
+        graph.create_entities([{"name": "Recycle", "entityType": "test"}])
+        assert False, "expected soft-deleted name to raise"
+    except ValueError as exc:
+        message = str(exc)
+        assert "soft-deleted" in message
+        assert "restore_entities" in message or "hard-delete" in message
+
+    # Active entity remains absent until restored; no silent skip.
+    assert graph.get_entity_by_name("Recycle") is None
+    assert graph.restore_entities(["Recycle"]) == 1
+    assert graph.get_entity_by_name("Recycle") is not None
+
+
 def test_hard_delete_entity(graph):
     graph.create_entities([{"name": "Gone", "entityType": "test"}])
     count = graph.delete_entities(["Gone"], hard=True)

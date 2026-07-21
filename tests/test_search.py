@@ -201,3 +201,49 @@ def test_fuzzy_search_fallback_preserves_best_match_order(graph):
 
     assert kg.entities
     assert kg.entities[0].name == "authentication"
+
+
+def test_soft_deleted_entities_do_not_pollute_observation_fts_or_hybrid(graph):
+    """Soft-deleted parents must not consume FTS/hybrid candidate slots."""
+    graph.create_entities(
+        [
+            {
+                "name": "ActiveDoc",
+                "entityType": "doc",
+                "observations": ["unique retrieval token alpha-active"],
+            },
+            {
+                "name": "DeletedDoc",
+                "entityType": "doc",
+                "observations": [
+                    "unique retrieval token alpha-deleted",
+                    "unique retrieval token alpha-deleted spare",
+                ],
+            },
+        ]
+    )
+    graph.delete_entities(["DeletedDoc"], hard=False)
+
+    kg = graph.search_fts("unique retrieval token alpha", limit=5)
+    names = [entity.name for entity in kg.entities]
+    assert "DeletedDoc" not in names
+    assert "ActiveDoc" in names
+
+    # Flood candidate budget with deleted observations; active must still surface.
+    for index in range(12):
+        graph.create_entities(
+            [
+                {
+                    "name": f"NoiseDeleted{index}",
+                    "entityType": "doc",
+                    "observations": [f"unique retrieval token alpha-noise-{index}"],
+                }
+            ]
+        )
+    graph.delete_entities([f"NoiseDeleted{index}" for index in range(12)], hard=False)
+
+    kg2 = graph.search_fts("unique retrieval token alpha", limit=3)
+    names2 = [entity.name for entity in kg2.entities]
+    assert "ActiveDoc" in names2
+    assert all(not name.startswith("NoiseDeleted") for name in names2)
+    assert "DeletedDoc" not in names2

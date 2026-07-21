@@ -190,7 +190,16 @@ class KnowledgeGraphManager:
                 except sqlite3.IntegrityError:
                     cx.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     cx.execute(f"RELEASE SAVEPOINT {savepoint}")
-                    # Duplicate name — skip
+                    deleted = cx.execute(
+                        "SELECT id FROM entities WHERE name = ? AND deleted_at IS NOT NULL",
+                        (name,),
+                    ).fetchone()
+                    if deleted is not None:
+                        raise ValueError(
+                            f"Entity '{name}' exists but is soft-deleted; "
+                            "restore it with restore_entities or hard-delete it before recreating"
+                        ) from None
+                    # Active duplicate name — skip (legacy create_entities behavior)
                     continue
                 except Exception:
                     cx.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -725,13 +734,16 @@ class KnowledgeGraphManager:
             ).fetchall()
             exact_name_ids = {row["id"] for row in exact_name_rows}
 
-        # Search observation content
+        # Search observation content (only for active parent entities)
         try:
             rows = cx.execute(
                 """
                 SELECT o.entity_id, rank FROM fts_observations fo
                 JOIN observations o ON o.id = fo.rowid
-                WHERE fts_observations MATCH ? AND o.deleted_at IS NULL
+                JOIN entities e ON e.id = o.entity_id
+                WHERE fts_observations MATCH ?
+                  AND o.deleted_at IS NULL
+                  AND e.deleted_at IS NULL
                 ORDER BY rank
                 LIMIT ?
                 """,
@@ -778,14 +790,16 @@ class KnowledgeGraphManager:
                     embedding_scores[er["entity_id"]] = max(
                         embedding_scores.get(er["entity_id"], 0.0), sim
                     )
-                # Also score via observation embeddings
+                # Also score via observation embeddings for active entities only
                 obs_bucket_sql, obs_bucket_params = _embedding_bucket_filter("oe", query_emb)
                 obs_emb_rows = cx.execute(
                     f"""
                     SELECT oe.observation_id, oe.embedding, o.entity_id
                     FROM observation_embeddings oe
                     JOIN observations o ON o.id = oe.observation_id
+                    JOIN entities e ON e.id = o.entity_id
                     WHERE o.deleted_at IS NULL
+                      AND e.deleted_at IS NULL
                       AND oe.model_name = ? AND oe.dimension = ?
                       AND {obs_bucket_sql}
                     ORDER BY oe.observation_id DESC
@@ -2331,9 +2345,16 @@ class KnowledgeGraphManager:
             if similarity > 0.1:
                 best_scores[row["id"]] = similarity
 
-        # Also score observation content (Limit fallback scan)
+        # Also score observation content for active entities only (limit fallback scan)
         obs_rows = cx.execute(
-            "SELECT entity_id, content FROM observations WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 10000"
+            """
+            SELECT o.entity_id, o.content
+            FROM observations o
+            JOIN entities e ON e.id = o.entity_id
+            WHERE o.deleted_at IS NULL AND e.deleted_at IS NULL
+            ORDER BY o.updated_at DESC
+            LIMIT 10000
+            """
         ).fetchall()
         for row in obs_rows:
             text = row["content"].lower()
