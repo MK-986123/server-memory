@@ -9,25 +9,73 @@ Levels:
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
-import tiktoken
-
 from .config import CompressionLevel
 from .models import PROTECTED_OBS_TYPES, Entity, KnowledgeGraph, Observation, Relation
+
+logger = logging.getLogger(__name__)
 
 # Filler words to strip at MEDIUM+ compression
 _FILLER = re.compile(
     r"\b(the|a|an|is|are|was|were|has|have|had|that|this|it|its|for|of|in|on|to|and|or|but|with|from|by|as|at|be|been|being)\b",
     re.IGNORECASE,
 )
-_TOKENIZER = tiktoken.get_encoding("cl100k_base")
+
+# Lazy optional tokenizer. Import and encoding load happen only when counting.
+_TOKENIZER = None
+_TOKENIZER_TRIED = False
+_TOKENIZER_UNAVAILABLE = object()
+
+
+def _approximate_tokens(text: str) -> int:
+    """Deterministic character-based estimate used without tiktoken."""
+    return max(1, len(text) // 4) if text else 1
+
+
+def _get_tokenizer():
+    """Return cl100k_base tokenizer or None when unavailable.
+
+    Never requires network access at import time. Failures fall back to the
+    approximate estimator for the process lifetime.
+    """
+    global _TOKENIZER, _TOKENIZER_TRIED
+    if _TOKENIZER_TRIED:
+        return None if _TOKENIZER is _TOKENIZER_UNAVAILABLE else _TOKENIZER
+    _TOKENIZER_TRIED = True
+    try:
+        import tiktoken  # optional dependency
+    except ImportError:
+        logger.info("tiktoken not installed; using approximate token estimates")
+        _TOKENIZER = _TOKENIZER_UNAVAILABLE
+        return None
+    try:
+        _TOKENIZER = tiktoken.get_encoding("cl100k_base")
+    except Exception as exc:  # pragma: no cover - depends on local tiktoken cache
+        logger.warning(
+            "tiktoken tokenizer unavailable (%s); using approximate token estimates",
+            exc,
+        )
+        _TOKENIZER = _TOKENIZER_UNAVAILABLE
+        return None
+    return _TOKENIZER
 
 
 def _estimate_tokens(text: str) -> int:
-    """Measure rendered output with the documented cl100k_base tokenizer."""
-    return len(_TOKENIZER.encode(text))
+    """Count tokens with tiktoken when available, else approximate ~4 chars/token."""
+    tokenizer = _get_tokenizer()
+    if tokenizer is None:
+        return _approximate_tokens(text)
+    return len(tokenizer.encode(text))
+
+
+def _reset_tokenizer_cache_for_tests() -> None:
+    """Test helper to re-evaluate tokenizer availability."""
+    global _TOKENIZER, _TOKENIZER_TRIED
+    _TOKENIZER = None
+    _TOKENIZER_TRIED = False
 
 
 def _truncate_to_budget(text: str, token_budget: int) -> str:

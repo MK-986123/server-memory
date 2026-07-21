@@ -1,9 +1,18 @@
 """Tests for multi-level compression."""
 
+import importlib
+import sys
+
+import pytest
+
+from server_memory import compression as compression_module
 from server_memory.compression import (
     CompressionLevel,
+    _approximate_tokens,
     _enforce_budget,
     _estimate_tokens,
+    _get_tokenizer,
+    _reset_tokenizer_cache_for_tests,
     compress_graph,
     format_entity_heavy,
     format_entity_light,
@@ -191,3 +200,67 @@ def test_punctuation_heavy_ascii_cannot_bypass_token_budget():
 
     assert _estimate_tokens(output) <= 25
     assert len(output) < len(adversarial) // 2
+
+
+def test_module_import_does_not_require_tiktoken(monkeypatch):
+    """Core import must not eagerly load or fetch tokenizer data."""
+    monkeypatch.setitem(sys.modules, "tiktoken", None)
+    # Ensure cached state is cleared and the module is re-imported under the stub.
+    if "server_memory.compression" in sys.modules:
+        del sys.modules["server_memory.compression"]
+    reloaded = importlib.import_module("server_memory.compression")
+    assert reloaded._TOKENIZER_TRIED is False
+    assert reloaded._TOKENIZER is None
+    # Restore the real module for subsequent tests in this process.
+    del sys.modules["server_memory.compression"]
+    importlib.import_module("server_memory.compression")
+    _reset_tokenizer_cache_for_tests()
+
+
+def test_estimate_tokens_uses_tiktoken_when_available():
+    _reset_tokenizer_cache_for_tests()
+    pytest.importorskip("tiktoken")
+    tokenizer = _get_tokenizer()
+    assert tokenizer is not None
+    text = "hello world from server-memory"
+    assert _estimate_tokens(text) == len(tokenizer.encode(text))
+    assert _estimate_tokens(text) != _approximate_tokens(text) or len(text) < 8
+
+
+def test_estimate_tokens_falls_back_when_tiktoken_missing(monkeypatch):
+    _reset_tokenizer_cache_for_tests()
+
+    def boom(_name):
+        raise ImportError("tiktoken missing for test")
+
+    monkeypatch.setitem(sys.modules, "tiktoken", None)
+    # Force import failure path inside _get_tokenizer.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "tiktoken":
+            raise ImportError("tiktoken missing for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    text = "abcd" * 10
+    assert _estimate_tokens(text) == _approximate_tokens(text)
+    # Second call uses the cached unavailable sentinel without re-importing.
+    assert _estimate_tokens(text) == _approximate_tokens(text)
+    _reset_tokenizer_cache_for_tests()
+
+
+def test_estimate_tokens_falls_back_when_tokenizer_init_fails(monkeypatch):
+    _reset_tokenizer_cache_for_tests()
+
+    class FakeTiktoken:
+        @staticmethod
+        def get_encoding(_name):
+            raise RuntimeError("encoder data unavailable offline")
+
+    monkeypatch.setitem(sys.modules, "tiktoken", FakeTiktoken())
+    text = "offline tokenizer path"
+    assert _estimate_tokens(text) == _approximate_tokens(text)
+    _reset_tokenizer_cache_for_tests()
