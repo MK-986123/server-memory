@@ -116,3 +116,26 @@ def test_snapshot_conflict_checks_every_semantic_table(tmp_path):
     finally:
         target.close()
         source.close()
+
+
+def test_snapshot_conflict_rejects_forged_system_tag(tmp_path):
+    source = Database(tmp_path / "source-system.db")
+    target = Database(tmp_path / "target-system.db")
+    source.open()
+    target.open()
+    try:
+        snapshot = source.export_snapshot()
+        target.cx.execute(
+            "INSERT INTO tags (name, description, color, is_system) "
+            "VALUES ('forged-system', 'not seeded', '', 1)"
+        )
+        target.cx.commit()
+        before = target.export_snapshot()
+
+        with pytest.raises(ValueError, match="target store is not empty"):
+            target.import_snapshot(snapshot)
+
+        assert target.export_snapshot() == before
+    finally:
+        target.close()
+        source.close()
