@@ -19,18 +19,24 @@ class CompressionLevel(IntEnum):
 
 
 def env_path_or_default(name: str, default: Path) -> Path:
-    """Resolve a path env var, treating blank values as unset."""
+    """Resolve a path env var, treating unset/empty/whitespace-only values as absent.
+
+    Surrounding whitespace is stripped from explicit values. Blank overrides must
+    never resolve to the process cwd or repository root.
+    """
     value = os.environ.get(name)
     if value is None or not value.strip():
         return default
-    return Path(value)
+    return Path(value.strip())
 
 
 @dataclass(frozen=True)
 class MemoryConfig:
     """Configuration resolved from environment variables and workspace context."""
 
-    db_path: Path = field(default_factory=lambda: env_path_or_default("MEMORY_DB_PATH", default_db_path()))
+    db_path: Path = field(
+        default_factory=lambda: env_path_or_default("MEMORY_DB_PATH", default_db_path())
+    )
     compression_level: CompressionLevel = field(
         default_factory=lambda: CompressionLevel(
             int(os.environ.get("MEMORY_COMPRESSION_LEVEL", "4"))  # Default AUTO
@@ -51,6 +57,9 @@ class MemoryConfig:
     )
     write_embedding_budget_ms: int = field(
         default_factory=lambda: int(os.environ.get("MEMORY_WRITE_EMBEDDING_BUDGET_MS", "10000"))
+    )
+    write_timeout_ms: int = field(
+        default_factory=lambda: int(os.environ.get("MEMORY_WRITE_TIMEOUT_MS", "30000"))
     )
     project: str = field(default_factory=lambda: os.environ.get("MEMORY_PROJECT", ""))
     dedup_threshold: float = field(
@@ -82,6 +91,12 @@ class MemoryConfig:
     global_preference_routing_enabled: bool = field(
         default_factory=lambda: (
             os.environ.get("MEMORY_GLOBAL_PREFERENCE_ROUTING_ENABLED", "true").lower()
+            in ("true", "1", "yes")
+        )
+    )
+    retention_cleanup_enabled: bool = field(
+        default_factory=lambda: (
+            os.environ.get("MEMORY_RETENTION_CLEANUP_ENABLED", "true").lower()
             in ("true", "1", "yes")
         )
     )

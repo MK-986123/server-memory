@@ -13,3 +13,5 @@ def test_memory_context_benchmark_scenarios_are_fixed_and_reportable():
     assert results["total"] == len(BENCHMARK_SCENARIOS)
     assert 0 <= results["hit_at_1"] <= results["hit_at_3"] <= results["total"]
     assert isinstance(results["misses"], list)
+    assert results["hit_at_1"] >= results["total"] - 1
+    assert results["hit_at_3"] == results["total"]

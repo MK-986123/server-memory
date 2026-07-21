@@ -89,7 +89,7 @@ The goal is to return the smallest useful memory slice for the current task, not
 | :--- | :--- |
 | **Storage** | SQLite with WAL mode and FTS5 search |
 | **Memory model** | Entities, observations, relations, tags, and activity |
-| **MCP interface** | 20 tools; no MCP resources or prompts |
+| **MCP interface** | 22 tools; no MCP resources or prompts |
 | **Routine recall** | Compact `memory_context` output |
 | **Broader recall** | `memory_context_full`, graph reads, node search, and timeline queries |
 | **Retrieval** | FTS5, ranking signals, fuzzy fallback, and optional embeddings |
@@ -108,6 +108,11 @@ The goal is to return the smallest useful memory slice for the current task, not
 - **Inspectable state:** memory remains readable, exportable, and testable.
 - **Scope safety:** destructive operations reject `scope="all"`.
 - **Graceful degradation:** lexical retrieval remains available without embeddings.
+- **Recoverable deletion:** entity deletes are soft by default, with list and restore tools; hard delete remains explicit.
+- **Portable snapshots:** `export_graph(format="snapshot")` emits a multi-scope snapshot (`server-memory-multiscope-snapshot` v1 with a `scopes` map). `import_graph` accepts that format plus classic JSON/JSONL graph payloads.
+- **Optional exact token counts:** install the `tokenizer` extra (`tiktoken`) for cl100k_base counting; approximate character-based budgets remain available without it.
+
+On open, the server migrates workspace and global SQLite databases in place up to schema version 6 (embedding dimension metadata, locality-sensitive hash buckets, and related indexes). The first open after upgrading may take longer when embedding tables are large because bucket columns are backfilled in a single migration pass. Incomplete upgrades resume via required-column detection. Always back up production databases before upgrading the package.
 
 ## Architecture
 
@@ -172,6 +177,14 @@ python -m pip install "server-memory[embeddings] @ git+https://github.com/MK-986
 ```
 
 Embeddings are optional. Core storage and FTS5 retrieval work without them.
+
+### Optional benchmark extra
+
+```bash
+python -m pip install "server-memory[benchmark] @ git+https://github.com/MK-986123/server-memory.git"
+```
+
+The optional `benchmark` extra installs PyYAML and tiktoken for the local evaluation harness under `benchmark/`. It is not required to run the MCP server.
 
 ### Development checkout
 
@@ -300,7 +313,7 @@ Preference-tagged writes can automatically route to the global database when glo
 > Destructive operations require an explicit `workspace` or `global` scope. They reject `scope="all"` to prevent accidental cross-database deletion, merging, or tag removal.
 
 <details>
-<summary><strong>View all 20 MCP tools</strong></summary>
+<summary><strong>View all 22 MCP tools</strong></summary>
 
 | Tool | Purpose | Main inputs |
 | :--- | :--- | :--- |
@@ -316,12 +329,14 @@ Preference-tagged writes can automatically route to the global database when glo
 | `query_timeline` | Query activity history | `time_range`, `start`, `end`, `actions`, `entity_name`, `session_id`, `limit`, `scope` |
 | `manage_tags` | List, create, delete, apply, remove, or clean tags | `action`, `name`, `entity_name`, `tag_name`, `scope` |
 | `merge_entities` | Merge one entity into another | `source`, `target`, `strategy`, `scope` |
-| `export_graph` | Export graph as JSON or JSONL | `format`, `scope` |
-| `import_graph` | Import JSON or JSONL graph data | `data`, `scope` |
+| `export_graph` | Export graph as JSON, JSONL, or multi-scope snapshot (`format=snapshot`) | `format`, `scope` |
+| `import_graph` | Import JSON, JSONL, or multi-scope snapshot data | `data`, `scope` |
 | `memory_stats` | Return counts and storage statistics | `scope` |
 | `backup_memory` | Copy a SQLite database | `dest_path`, `scope` |
 | `get_observation_history` | Show observation versions for an entity | `entity_name`, `content_prefix`, `scope` |
 | `delete_entities` | Soft-delete or hard-delete entities | `entityNames`, `hard`, `scope` |
+| `list_deleted_entities` | List soft-deleted entities eligible for restore | `limit`, `scope` |
+| `restore_entities` | Restore soft-deleted entities by name in the selected scope | `entityNames`, `scope` |
 | `delete_observations` | Delete selected observations | `deletions`, `scope` |
 | `delete_relations` | Delete relations | `relations`, `scope` |
 
@@ -353,10 +368,11 @@ Configuration is environment-driven. Empty path overrides in `.env.example` use 
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
 | `MEMORY_COMPRESSION_LEVEL` | `4` | Compression level from `0` through `4`; `4` is automatic |
-| `MEMORY_TOKEN_BUDGET` | `2000` | Maximum approximate token budget for compressed graph output |
+| `MEMORY_TOKEN_BUDGET` | `2000` | Maximum token budget for compressed graph output (exact with optional `tokenizer` extra; otherwise approximate) |
 | `MEMORY_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Optional embedding model |
 | `MEMORY_EMBEDDING_ENABLED` | `true` | Enable embedding search and backfill when dependencies are available |
 | `MEMORY_WRITE_EMBEDDING_BUDGET_MS` | `10000` | Write-path embedding time budget |
+| `MEMORY_WRITE_TIMEOUT_MS` | `30000` | Interactive write deadline while waiting for a SQLite lock; lower for fail-fast operators |
 | `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic deduplication threshold |
 
 ### Runtime and shared daemon
@@ -367,14 +383,26 @@ Configuration is environment-driven. Empty path overrides in `.env.example` use 
 | `MEMORY_SESSION_ID` | Unset | Session identifier for activity logging |
 | `MEMORY_HTTP_AUTH_ENABLED` | `true` | Require bearer authentication for the shared HTTP daemon |
 | `MEMORY_AUTH_TOKEN_PATH` | Platform runtime directory | Local HTTP daemon token file |
+| `MEMORY_RETENTION_CLEANUP_ENABLED` | `true` | Run startup retention cleanup for expired ephemeral tags |
 
 </details>
+
+Optional install extras:
+
+| Extra | Provides |
+| :--- | :--- |
+| `embeddings` | sentence-transformers semantic search |
+| `tokenizer` | exact cl100k_base token counting via tiktoken (approximate counting works without it) |
+| `benchmark` | local evaluation harness dependencies, including tiktoken when measuring budgets |
+| `dev` | pytest, ruff, build, twine, pip-audit |
 
 ## Evaluation
 
 The repository includes deterministic retrieval scenarios for `memory_context`, including exact-name lookup, importance ranking, pinned facts, access recency, activity links, file-path hints, stale-fact demotion, lexical fallback, and duplicate suppression.
 
 Those tests validate expected ranking behavior, but they do not establish real-world improvements in agent completion rate or token use.
+
+A local harness under `benchmark/` exercises compression and retrieval-scale scenarios against synthetic corpora. Install the optional `benchmark` extra when running those scripts. Treat published run notes under `docs/benchmarks/` as machine- and corpus-specific measurements, not as general product performance claims.
 
 A separate controlled protocol is provided in [`docs/BENCHMARK_PROTOCOL.md`](docs/BENCHMARK_PROTOCOL.md). It compares:
 

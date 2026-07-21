@@ -5,7 +5,7 @@ import struct
 import pytest
 
 from server_memory.db import Database
-from server_memory.embeddings import EmbeddingEngine
+from server_memory.embeddings import EmbeddingEngine, embedding_buckets
 from server_memory.graph import KnowledgeGraphManager
 
 
@@ -94,6 +94,16 @@ class WeakSemanticNoiseEmbeddingEngine(EmbeddingEngine):
         if "sqlite" in query and "lock" in query and "gpu" in value:
             return 0.24
         return 0.0
+
+
+class CountingMockEmbeddingEngine(MockEmbeddingEngine):
+    def __init__(self):
+        super().__init__()
+        self.comparisons = 0
+
+    def cosine_similarity(self, a: bytes, b: bytes) -> float:
+        self.comparisons += 1
+        return super().cosine_similarity(a, b)
 
 
 @pytest.fixture
@@ -342,3 +352,81 @@ def test_memory_context_filters_weak_semantic_only_noise(db_with_embeddings):
 
     assert "SQLite Lock Notes" in names
     assert "GPU Tuning Notes" not in names
+
+
+def test_search_ignores_embeddings_from_a_different_model(db_with_embeddings):
+    graph = KnowledgeGraphManager(
+        db_with_embeddings,
+        session_id="test",
+        embedding_engine=MockEmbeddingEngine(),
+    )
+    graph.create_entities(
+        [{"name": "Database Notes", "entityType": "note", "observations": ["SQL index"]}]
+    )
+    db_with_embeddings.cx.execute("UPDATE entity_embeddings SET model_name = 'old-model'")
+    db_with_embeddings.cx.execute("UPDATE observation_embeddings SET model_name = 'old-model'")
+
+    result = graph.search_fts("authentication")
+
+    assert result.entities == []
+
+
+def test_semantic_search_scores_a_bounded_candidate_set(db_with_embeddings, monkeypatch):
+    engine = CountingMockEmbeddingEngine()
+    graph = KnowledgeGraphManager(db_with_embeddings, embedding_engine=engine)
+    monkeypatch.setattr(graph, "_schedule_embedding_backfill", lambda: None)
+    blob = engine.embed_text("database")
+    assert blob is not None
+    with db_with_embeddings.transaction() as cx:
+        for index in range(1_100):
+            entity_id = cx.execute(
+                "INSERT INTO entities(name, entity_type) VALUES (?, 'note')",
+                (f"Noise {index}",),
+            ).lastrowid
+            cx.execute(
+                "INSERT INTO entity_embeddings(entity_id, embedding, model_name, dimension, "
+                "bucket0, bucket1, bucket2, bucket3) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entity_id,
+                    blob,
+                    engine.model_name,
+                    len(blob) // 4,
+                    *embedding_buckets(blob),
+                ),
+            )
+
+    graph.search_fts("authentication")
+
+    assert engine.comparisons <= 1_000
+
+
+class OldTargetEmbeddingEngine(EmbeddingEngine):
+    def __init__(self):
+        super().__init__("old-target-model")
+        self._available = True
+
+    def is_available(self) -> bool:
+        return True
+
+    def embed_text(self, text: str) -> bytes | None:
+        value = -1.0 if "noise" in text.lower() else 1.0
+        return struct.pack("48f", *([value] * 48))
+
+    def embed_batch(self, texts: list[str]) -> list[bytes]:
+        return [self.embed_text(text) for text in texts]
+
+
+def test_semantic_search_recalls_old_target_beyond_candidate_window(db_with_embeddings):
+    engine = OldTargetEmbeddingEngine()
+    graph = KnowledgeGraphManager(db_with_embeddings, embedding_engine=engine)
+    graph.create_entities(
+        [{"name": "Ancient Alpha", "entityType": "note", "observations": ["durable fact"]}]
+    )
+    graph.create_entities(
+        [{"name": f"Noise {index}", "entityType": "note"} for index in range(1_001)]
+    )
+
+    result = graph.search_fts("forgotten concept", limit=3)
+
+    assert result.entities
+    assert result.entities[0].name == "Ancient Alpha"

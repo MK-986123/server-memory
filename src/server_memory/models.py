@@ -17,6 +17,7 @@ class Entity:
     updated_at: str = ""
     last_accessed_at: str = ""
     deleted_at: str | None = None
+    scope: str = ""
 
     # Populated by joins, not stored in entities table
     observations: list[Observation] = field(default_factory=list)
@@ -37,6 +38,8 @@ class Entity:
         }
         if self.tags:
             d["tags"] = self.tags
+        if self.scope:
+            d["scope"] = self.scope
         return d
 
 
@@ -84,6 +87,7 @@ class Relation:
     created_at: str = ""
     updated_at: str = ""
     deleted_at: str | None = None
+    scope: str = ""
 
     # Populated by joins
     from_name: str = ""
@@ -91,11 +95,14 @@ class Relation:
     tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "from": self.from_name,
             "to": self.to_name,
             "relationType": self.relation_type,
         }
+        if self.scope:
+            result["scope"] = self.scope
+        return result
 
 
 @dataclass
