@@ -18,19 +18,13 @@ class CompressionLevel(IntEnum):
     AUTO = 4  # Dynamically pick best level to fit budget
 
 
-def env_path_or_default(name: str, default: Path) -> Path:
-    """Resolve a path env var, treating blank values as unset."""
-    value = os.environ.get(name)
-    if value is None or not value.strip():
-        return default
-    return Path(value)
-
-
 @dataclass(frozen=True)
 class MemoryConfig:
     """Configuration resolved from environment variables and workspace context."""
 
-    db_path: Path = field(default_factory=lambda: env_path_or_default("MEMORY_DB_PATH", default_db_path()))
+    db_path: Path = field(
+        default_factory=lambda: Path(os.environ.get("MEMORY_DB_PATH", str(default_db_path())))
+    )
     compression_level: CompressionLevel = field(
         default_factory=lambda: CompressionLevel(
             int(os.environ.get("MEMORY_COMPRESSION_LEVEL", "4"))  # Default AUTO
@@ -52,6 +46,9 @@ class MemoryConfig:
     write_embedding_budget_ms: int = field(
         default_factory=lambda: int(os.environ.get("MEMORY_WRITE_EMBEDDING_BUDGET_MS", "10000"))
     )
+    write_timeout_ms: int = field(
+        default_factory=lambda: int(os.environ.get("MEMORY_WRITE_TIMEOUT_MS", "1500"))
+    )
     project: str = field(default_factory=lambda: os.environ.get("MEMORY_PROJECT", ""))
     dedup_threshold: float = field(
         default_factory=lambda: float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92"))
@@ -63,9 +60,8 @@ class MemoryConfig:
         )
     )
     auth_token_path: Path = field(
-        default_factory=lambda: env_path_or_default(
-            "MEMORY_AUTH_TOKEN_PATH",
-            default_auth_token_path(),
+        default_factory=lambda: Path(
+            os.environ.get("MEMORY_AUTH_TOKEN_PATH", str(default_auth_token_path()))
         )
     )
     global_db_enabled: bool = field(
@@ -74,14 +70,19 @@ class MemoryConfig:
         )
     )
     global_db_path: Path = field(
-        default_factory=lambda: env_path_or_default(
-            "MEMORY_GLOBAL_DB_PATH",
-            default_global_db_path(),
+        default_factory=lambda: Path(
+            os.environ.get("MEMORY_GLOBAL_DB_PATH", str(default_global_db_path()))
         )
     )
     global_preference_routing_enabled: bool = field(
         default_factory=lambda: (
             os.environ.get("MEMORY_GLOBAL_PREFERENCE_ROUTING_ENABLED", "true").lower()
+            in ("true", "1", "yes")
+        )
+    )
+    retention_cleanup_enabled: bool = field(
+        default_factory=lambda: (
+            os.environ.get("MEMORY_RETENTION_CLEANUP_ENABLED", "true").lower()
             in ("true", "1", "yes")
         )
     )

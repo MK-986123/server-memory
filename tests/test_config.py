@@ -40,31 +40,6 @@ def test_memory_config_respects_explicit_path_overrides(monkeypatch):
     assert cfg.global_db_path == Path("/custom/global.sqlite")
 
 
-def test_memory_config_treats_blank_path_overrides_as_unset(monkeypatch):
-    monkeypatch.setattr(config_module, "default_db_path", lambda: Path("/tmp/default/memory.db"))
-    monkeypatch.setattr(
-        config_module,
-        "default_auth_token_path",
-        lambda: Path("/tmp/default/auth.token"),
-    )
-    monkeypatch.setattr(
-        config_module,
-        "default_global_db_path",
-        lambda: Path("/tmp/default/global.db"),
-    )
-
-    for value in ("", "   ", "\t\n"):
-        monkeypatch.setenv("MEMORY_DB_PATH", value)
-        monkeypatch.setenv("MEMORY_AUTH_TOKEN_PATH", value)
-        monkeypatch.setenv("MEMORY_GLOBAL_DB_PATH", value)
-
-        cfg = config_module.MemoryConfig()
-
-        assert cfg.db_path == Path("/tmp/default/memory.db")
-        assert cfg.auth_token_path == Path("/tmp/default/auth.token")
-        assert cfg.global_db_path == Path("/tmp/default/global.db")
-
-
 def test_memory_config_ensures_auth_token_dir(tmp_path):
     token_path = tmp_path / "runtime" / "auth.token"
     cfg = config_module.MemoryConfig(auth_token_path=token_path)

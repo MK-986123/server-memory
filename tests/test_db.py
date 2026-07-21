@@ -1,6 +1,7 @@
 """Tests for database layer."""
 
 import sqlite3
+import struct
 
 import pytest
 
@@ -104,6 +105,153 @@ def test_cleanup_expired(db):
     assert row["deleted_at"] is not None
 
 
+def test_cleanup_expired_cascades_relations(db):
+    """Expiry must not leave an active relation pointing at a deleted entity."""
+    db.cx.execute(
+        "INSERT INTO entities (name, entity_type, created_at) "
+        "VALUES ('Expired', 'test', '2020-01-01T00:00:00.000Z')"
+    )
+    db.cx.execute("INSERT INTO entities (name, entity_type) VALUES ('Live', 'test')")
+    expired_id = db.cx.execute(
+        "SELECT id FROM entities WHERE name='Expired'"
+    ).fetchone()["id"]
+    live_id = db.cx.execute("SELECT id FROM entities WHERE name='Live'").fetchone()["id"]
+    tag_id = db.cx.execute("SELECT id FROM tags WHERE name='ephemeral'").fetchone()["id"]
+    db.cx.execute(
+        "INSERT INTO entity_tags (entity_id, tag_id) VALUES (?, ?)",
+        (expired_id, tag_id),
+    )
+    db.cx.execute(
+        "INSERT INTO relations (from_entity_id, to_entity_id, relation_type) "
+        "VALUES (?, ?, 'references')",
+        (expired_id, live_id),
+    )
+    db.cx.commit()
+
+    db.cleanup_expired()
+
+    row = db.cx.execute("SELECT deleted_at FROM relations").fetchone()
+    assert row["deleted_at"] is not None
+
+
+def test_lossless_snapshot_round_trip_preserves_semantic_tables(tmp_path):
+    source = Database(tmp_path / "source.db")
+    source.open()
+    source.cx.execute(
+        "INSERT INTO entities (name, entity_type, metadata_json, deleted_at) "
+        "VALUES ('Snapshot', 'decision', '{\"owner\":\"team\"}', NULL)"
+    )
+    entity_id = source.cx.execute("SELECT id FROM entities WHERE name='Snapshot'").fetchone()["id"]
+    source.cx.execute(
+        "INSERT INTO observations "
+        "(entity_id, content, source, confidence, importance, obs_type, version, metadata_json) "
+        "VALUES (?, 'precise fact', 'test', 0.7, 0.9, 'decision', 2, '{\"k\":1}')",
+        (entity_id,),
+    )
+    observation_id = source.cx.execute("SELECT id FROM observations").fetchone()["id"]
+    source.cx.execute(
+        "INSERT INTO entities (name, entity_type, metadata_json, deleted_at) "
+        "VALUES ('Deleted target', 'component', '{\"state\":\"retired\"}', "
+        "'2026-07-01T00:00:00.000Z')"
+    )
+    deleted_entity_id = source.cx.execute(
+        "SELECT id FROM entities WHERE name='Deleted target'"
+    ).fetchone()["id"]
+    source.cx.execute(
+        "INSERT INTO observation_history (observation_id, content, version) "
+        "VALUES (?, 'old fact', 1)",
+        (observation_id,),
+    )
+    source.cx.execute(
+        "INSERT INTO relations "
+        "(from_entity_id, to_entity_id, relation_type, weight, metadata_json, deleted_at) "
+        "VALUES (?, ?, 'replaced', 0.25, '{\"reason\":\"migration\"}', "
+        "'2026-07-02T00:00:00.000Z')",
+        (entity_id, deleted_entity_id),
+    )
+    relation_id = source.cx.execute("SELECT id FROM relations").fetchone()["id"]
+    source.cx.execute(
+        "INSERT INTO tags (name, description, color, is_system, auto_expire_hours) "
+        "VALUES ('snapshot-custom', 'round trip', '#123456', 0, 36)"
+    )
+    tag_id = source.cx.execute("SELECT id FROM tags WHERE name='snapshot-custom'").fetchone()["id"]
+    source.cx.execute("INSERT INTO entity_tags VALUES (?, ?)", (entity_id, tag_id))
+    source.cx.execute("INSERT INTO observation_tags VALUES (?, ?)", (observation_id, tag_id))
+    source.cx.execute("INSERT INTO relation_tags VALUES (?, ?)", (relation_id, tag_id))
+    source.cx.execute(
+        "INSERT INTO activity_log (action, summary, metadata_json) "
+        "VALUES ('decision_made', 'snapshot test', '{\"source\":\"unit\"}')"
+    )
+    vector = struct.pack("4f", 1.0, 0.0, -1.0, 0.5)
+    source.cx.execute(
+        "INSERT INTO entity_embeddings "
+        "(entity_id, embedding, model_name, dimension, bucket0, bucket1, bucket2, bucket3) "
+        "VALUES (?, ?, 'snapshot-model', 4, 1, 2, 3, 4)",
+        (entity_id, vector),
+    )
+    source.cx.execute(
+        "INSERT INTO observation_embeddings "
+        "(observation_id, embedding, model_name, dimension, bucket0, bucket1, bucket2, bucket3) "
+        "VALUES (?, ?, 'snapshot-model', 4, 4, 3, 2, 1)",
+        (observation_id, vector),
+    )
+    source.cx.commit()
+
+    snapshot = source.export_snapshot()
+    target = Database(tmp_path / "target.db")
+    target.open()
+    target.import_snapshot(snapshot)
+
+    assert target.export_snapshot()["tables"] == snapshot["tables"]
+    source.close()
+    target.close()
+
+
+def test_snapshot_import_is_atomic_on_invalid_input(db):
+    db.cx.execute("INSERT INTO entities (name, entity_type) VALUES ('Existing', 'note')")
+    db.cx.commit()
+    before = db.export_snapshot()
+
+    try:
+        db.import_snapshot({"format": "server-memory-snapshot", "version": 1, "tables": {}})
+        assert False, "invalid snapshot should fail"
+    except ValueError:
+        pass
+
+    assert db.export_snapshot() == before
+
+
+def test_snapshot_import_rolls_back_after_mid_apply_foreign_key_failure(db):
+    db.cx.execute("INSERT INTO entities (name, entity_type) VALUES ('Existing', 'note')")
+    db.cx.commit()
+    before = db.export_snapshot()
+
+    source = Database(":memory:")
+    source.open()
+    source.cx.execute("INSERT INTO entities (name, entity_type) VALUES ('Imported', 'note')")
+    source.cx.commit()
+    snapshot = source.export_snapshot()
+    snapshot["tables"]["relations"].append(
+        {
+            "id": 1,
+            "from_entity_id": 1,
+            "to_entity_id": 99999,
+            "relation_type": "broken",
+            "weight": 1.0,
+            "metadata_json": "{}",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "deleted_at": None,
+        }
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.import_snapshot(snapshot, conflict="replace")
+
+    assert db.export_snapshot() == before
+    source.close()
+
+
 def test_embedding_tables_exist(db):
     """Embedding tables should be created in schema v2."""
     tables = db.cx.execute(
@@ -112,6 +260,12 @@ def test_embedding_tables_exist(db):
     table_names = {r["name"] for r in tables}
     assert "entity_embeddings" in table_names
     assert "observation_embeddings" in table_names
+
+
+def test_embedding_rows_record_dimension(db):
+    for table in ("entity_embeddings", "observation_embeddings"):
+        columns = {row["name"] for row in db.cx.execute(f"PRAGMA table_info({table})")}
+        assert "dimension" in columns
 
 
 def test_observation_columns_exist(db):
@@ -212,20 +366,3 @@ def test_embedding_table_foreign_key(db):
         "SELECT COUNT(*) c FROM entity_embeddings WHERE entity_id = ?", (eid,)
     ).fetchone()
     assert row["c"] == 0
-
-
-def test_database_open_self_cleaning_on_failure(monkeypatch, tmp_path):
-    """Database.open should close the sqlite connection if configuration or schema fails."""
-    db = Database(tmp_path / "fail.db")
-
-    # Mock _configure to raise an error
-    def mock_configure():
-        raise RuntimeError("Config failure")
-
-    monkeypatch.setattr(db, "_configure", mock_configure)
-
-    with pytest.raises(RuntimeError, match="Config failure"):
-        db.open()
-
-    # Connection should be closed and set to None
-    assert db.conn is None

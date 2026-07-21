@@ -2,15 +2,39 @@
 
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import sqlite3
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+
+class DatabaseBusyError(sqlite3.OperationalError):
+    """Retryable interactive write failure after one bounded deadline."""
+
+    retryable = True
+
+SCHEMA_VERSION = 6
+SNAPSHOT_FORMAT = "server-memory-snapshot"
+SNAPSHOT_VERSION = 1
+SNAPSHOT_TABLES = (
+    "entities",
+    "observations",
+    "observation_history",
+    "relations",
+    "tags",
+    "entity_tags",
+    "observation_tags",
+    "relation_tags",
+    "activity_log",
+    "entity_embeddings",
+    "observation_embeddings",
+)
 
 SYSTEM_TAGS = [
     ("pinned", "Permanently retained entities", "#FFD700", True, None),
@@ -176,7 +200,9 @@ CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_entity_id)
 CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_log(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_log(action, created_at);
 
--- Embedding tables (schema v2)
+-- Embedding tables (schema v2 base). Columns dimension/buckets and their indexes
+-- are added by migrations v5/v6 so existing DBs can upgrade without DDL failing
+-- on CREATE INDEX against missing columns (CREATE TABLE IF NOT EXISTS is a no-op).
 CREATE TABLE IF NOT EXISTS entity_embeddings (
     entity_id INTEGER PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
     embedding BLOB NOT NULL,
@@ -196,12 +222,21 @@ CREATE TABLE IF NOT EXISTS observation_embeddings (
 class Database:
     """Manages SQLite connection with WAL mode, FK enforcement, and FTS5."""
 
-    CONNECT_TIMEOUT_SECONDS = 30.0
-    BUSY_TIMEOUT_MS = 30000
+    CONNECT_TIMEOUT_SECONDS = 1.5
+    BUSY_TIMEOUT_MS = 100
+    WRITE_TIMEOUT_SECONDS = 1.5
     LOCK_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8)
 
-    def __init__(self, db_path: str | Path = ":memory:"):
+    def __init__(
+        self,
+        db_path: str | Path = ":memory:",
+        *,
+        write_timeout_seconds: float = WRITE_TIMEOUT_SECONDS,
+    ):
         self.db_path = str(db_path)
+        if write_timeout_seconds <= 0:
+            raise ValueError("write_timeout_seconds must be positive")
+        self.write_timeout_seconds = write_timeout_seconds
         self.conn: sqlite3.Connection | None = None
 
     def open(self) -> None:
@@ -235,6 +270,14 @@ class Database:
         required_columns = {
             "entities": {"last_accessed_at"},
             "observations": {"importance", "obs_type"},
+            "entity_embeddings": {"dimension", "bucket0", "bucket1", "bucket2", "bucket3"},
+            "observation_embeddings": {
+                "dimension",
+                "bucket0",
+                "bucket1",
+                "bucket2",
+                "bucket3",
+            },
         }
 
         # Fast path: if schema is already at current version and required columns
@@ -267,6 +310,10 @@ class Database:
                     self._migrate_to_v3()
                 if current_version < 4:
                     self._migrate_to_v4()
+                if current_version < 5:
+                    self._migrate_to_v5()
+                if current_version < 6:
+                    self._migrate_to_v6()
                 # Record schema version
                 self.conn.execute(
                     "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
@@ -325,6 +372,48 @@ class Database:
             with suppress(sqlite3.OperationalError):
                 self.conn.execute(stmt)
 
+    def _migrate_to_v5(self) -> None:
+        """Migrate to v5: record embedding dimensions for compatibility checks."""
+        assert self.conn is not None
+        for table in ("entity_embeddings", "observation_embeddings"):
+            with suppress(sqlite3.OperationalError):
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN dimension INTEGER NOT NULL DEFAULT 0"
+                )
+            self.conn.execute(
+                f"UPDATE {table} SET dimension = length(embedding) / 4 WHERE dimension = 0"
+            )
+
+    def _migrate_to_v6(self) -> None:
+        """Add sign-projection buckets for recall-preserving bounded ANN lookup."""
+        assert self.conn is not None
+        from .embeddings import embedding_buckets
+
+        for table, id_column in (
+            ("entity_embeddings", "entity_id"),
+            ("observation_embeddings", "observation_id"),
+        ):
+            for column in ("bucket0", "bucket1", "bucket2", "bucket3"):
+                with suppress(sqlite3.OperationalError):
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
+            rows = self.conn.execute(
+                f"SELECT {id_column}, embedding FROM {table}"
+            ).fetchall()
+            for row in rows:
+                buckets = embedding_buckets(row["embedding"])
+                self.conn.execute(
+                    f"UPDATE {table} SET bucket0=?, bucket1=?, bucket2=?, bucket3=? "
+                    f"WHERE {id_column}=?",
+                    (*buckets, row[id_column]),
+                )
+            for bucket in range(4):
+                self.conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_bucket{bucket} "
+                    f"ON {table}(model_name, dimension, bucket{bucket})"
+                )
+
     def _has_required_columns(self, required_columns: dict[str, set[str]]) -> bool:
         """Check that the current schema matches the code's runtime expectations."""
         assert self.conn is not None
@@ -353,29 +442,35 @@ class Database:
             # Already in a transaction, just yield (no BEGIN/commit/rollback)
             yield cx
             return
-        # Not in a transaction, start one
-        for attempt, delay in enumerate((0.0, *self.LOCK_RETRY_DELAYS_SECONDS), start=1):
+        # Not in a transaction: every retry shares one end-to-end deadline.
+        deadline = time.monotonic() + self.write_timeout_seconds
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 cx.execute("BEGIN IMMEDIATE")
                 break
             except sqlite3.OperationalError as exc:
-                if (
-                    "locked" not in str(exc).lower()
-                    or delay == 0.0
-                    and len(self.LOCK_RETRY_DELAYS_SECONDS) == 0
-                ):
+                if "locked" not in str(exc).lower():
                     raise
-                if attempt > len(self.LOCK_RETRY_DELAYS_SECONDS):
-                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DatabaseBusyError(
+                        "memory database is locked/busy; retry this write shortly "
+                        f"(deadline {self.write_timeout_seconds:.2f}s, attempts {attempt})"
+                    ) from exc
+                delay = min(
+                    self.LOCK_RETRY_DELAYS_SECONDS[
+                        min(attempt - 1, len(self.LOCK_RETRY_DELAYS_SECONDS) - 1)
+                    ],
+                    remaining,
+                )
                 logger.warning(
-                    "DB locked acquiring write transaction (attempt %d/%d), retrying in %.2fs...",
+                    "DB locked acquiring write transaction (attempt %d), retrying in %.2fs...",
                     attempt,
-                    len(self.LOCK_RETRY_DELAYS_SECONDS) + 1,
                     delay,
                 )
                 time.sleep(delay)
-        else:  # pragma: no cover - defensive, loop always breaks or raises
-            raise sqlite3.OperationalError("database is locked")
 
         try:
             yield cx
@@ -426,6 +521,19 @@ class Database:
                 (tag_id, threshold),
             )
             total += res.rowcount
+        # Any entity expiry must cascade to its relations. This also repairs
+        # dangling active relations left by versions that did not cascade.
+        res = self.conn.execute(
+            f"""
+            UPDATE relations SET deleted_at = {now_expr}
+            WHERE deleted_at IS NULL
+              AND (
+                from_entity_id IN (SELECT id FROM entities WHERE deleted_at IS NOT NULL)
+                OR to_entity_id IN (SELECT id FROM entities WHERE deleted_at IS NOT NULL)
+              )
+            """
+        )
+        total += res.rowcount
         if total > 0:
             self.conn.commit()
         return total
@@ -488,11 +596,128 @@ class Database:
             self.conn.commit()
         return count
 
+    def export_snapshot(self) -> dict[str, Any]:
+        """Return a versioned, lossless snapshot of all semantic tables."""
+        tables: dict[str, list[dict[str, Any]]] = {}
+        for table in SNAPSHOT_TABLES:
+            rows = self.cx.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            serialized: list[dict[str, Any]] = []
+            for row in rows:
+                item: dict[str, Any] = {}
+                for key in row.keys():
+                    value = row[key]
+                    if isinstance(value, bytes):
+                        item[key] = {"$base64": base64.b64encode(value).decode("ascii")}
+                    else:
+                        item[key] = value
+                serialized.append(item)
+            tables[table] = serialized
+        return {
+            "format": SNAPSHOT_FORMAT,
+            "version": SNAPSHOT_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "tables": tables,
+        }
+
+    def import_snapshot(self, snapshot: dict[str, Any], *, conflict: str = "fail") -> None:
+        """Atomically restore a validated snapshot into an empty semantic store.
+
+        The initial merge policy is deliberately explicit: populated stores are
+        rejected rather than partially merged or silently overwritten.
+        """
+        if snapshot.get("format") != SNAPSHOT_FORMAT or snapshot.get("version") != SNAPSHOT_VERSION:
+            raise ValueError("unsupported snapshot format or version")
+        if conflict not in {"fail", "replace"}:
+            raise ValueError("conflict policy must be 'fail' or 'replace'")
+        tables = snapshot.get("tables")
+        if not isinstance(tables, dict) or set(tables) != set(SNAPSHOT_TABLES):
+            raise ValueError("snapshot must contain every semantic table exactly once")
+        if conflict == "fail" and self.cx.execute(
+            "SELECT EXISTS(SELECT 1 FROM entities) OR EXISTS(SELECT 1 FROM activity_log) AS used"
+        ).fetchone()["used"]:
+            raise ValueError("snapshot conflict: target store is not empty")
+
+        columns_by_table = {
+            table: [row["name"] for row in self.cx.execute(f"PRAGMA table_info({table})")]
+            for table in SNAPSHOT_TABLES
+        }
+        decoded: dict[str, list[dict[str, Any]]] = {}
+        for table, rows in tables.items():
+            if not isinstance(rows, list):
+                raise ValueError(f"snapshot table {table} must be a list")
+            expected = set(columns_by_table[table])
+            decoded_rows: list[dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict) or set(row) != expected:
+                    raise ValueError(f"snapshot row columns do not match table {table}")
+                item: dict[str, Any] = {}
+                for key, value in row.items():
+                    if isinstance(value, dict) and set(value) == {"$base64"}:
+                        try:
+                            item[key] = base64.b64decode(value["$base64"], validate=True)
+                        except (ValueError, TypeError) as exc:
+                            raise ValueError(f"invalid base64 in {table}.{key}") from exc
+                    else:
+                        item[key] = value
+                decoded_rows.append(item)
+            decoded[table] = decoded_rows
+
+        delete_order = (
+            "relation_tags",
+            "observation_tags",
+            "entity_tags",
+            "observation_history",
+            "entity_embeddings",
+            "observation_embeddings",
+            "relations",
+            "observations",
+            "activity_log",
+            "entities",
+            "tags",
+        )
+        insert_order = (
+            "entities",
+            "observations",
+            "observation_history",
+            "relations",
+            "tags",
+            "entity_tags",
+            "observation_tags",
+            "relation_tags",
+            "activity_log",
+            "entity_embeddings",
+            "observation_embeddings",
+        )
+        with self.transaction() as cx:
+            for table in delete_order:
+                cx.execute(f"DELETE FROM {table}")
+            for table in insert_order:
+                columns = columns_by_table[table]
+                placeholders = ",".join("?" for _ in columns)
+                sql = f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders})"
+                for row in decoded[table]:
+                    cx.execute(sql, [row[column] for column in columns])
+
     def backup(self, dest_path: str | Path) -> None:
-        """Create a full backup of the database."""
+        """Create a full no-clobber backup using an atomically reserved destination."""
         assert self.conn is not None
-        dest = sqlite3.connect(str(dest_path))
+        path = Path(dest_path)
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError as exc:
+            raise ValueError(f"backup destination already exists: {path}") from exc
+        # /proc/self/fd pins SQLite to the exact inode reserved above, closing
+        # the check-then-open and symlink-swap window on the supported Linux host.
+        proc_fd_path = Path(f"/proc/self/fd/{fd}")
+        sqlite_path = str(proc_fd_path if proc_fd_path.exists() else path)
+        try:
+            dest = sqlite3.connect(sqlite_path)
+        except Exception:
+            os.close(fd)
+            raise
         try:
             self.conn.backup(dest)
         finally:
             dest.close()
+            os.close(fd)

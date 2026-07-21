@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +25,6 @@ PROJECT_MARKERS = (
     "package.json",
     "Cargo.toml",
     "go.mod",
-    "README.md",
 )
 
 
@@ -49,7 +49,18 @@ def _find_workspace_marker(start: Path) -> Path | None:
     if candidate.is_file():
         candidate = candidate.parent
 
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    start_device = candidate.stat().st_dev
     for path in (candidate, *candidate.parents):
+        # A shared temporary root is not project ownership evidence. Its
+        # ambient markers must not merge unrelated temporary children.
+        if path == temp_root and candidate != temp_root:
+            break
+        try:
+            if path.stat().st_dev != start_device:
+                break
+        except OSError:
+            break
         for marker in PROJECT_MARKERS:
             if (path / marker).exists():
                 return path
