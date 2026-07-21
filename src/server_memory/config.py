@@ -18,12 +18,24 @@ class CompressionLevel(IntEnum):
     AUTO = 4  # Dynamically pick best level to fit budget
 
 
+def env_path_or_default(name: str, default: Path) -> Path:
+    """Resolve a path env var, treating unset/empty/whitespace-only values as absent.
+
+    Surrounding whitespace is stripped from explicit values. Blank overrides must
+    never resolve to the process cwd or repository root.
+    """
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return Path(value.strip())
+
+
 @dataclass(frozen=True)
 class MemoryConfig:
     """Configuration resolved from environment variables and workspace context."""
 
     db_path: Path = field(
-        default_factory=lambda: Path(os.environ.get("MEMORY_DB_PATH", str(default_db_path())))
+        default_factory=lambda: env_path_or_default("MEMORY_DB_PATH", default_db_path())
     )
     compression_level: CompressionLevel = field(
         default_factory=lambda: CompressionLevel(
@@ -60,8 +72,9 @@ class MemoryConfig:
         )
     )
     auth_token_path: Path = field(
-        default_factory=lambda: Path(
-            os.environ.get("MEMORY_AUTH_TOKEN_PATH", str(default_auth_token_path()))
+        default_factory=lambda: env_path_or_default(
+            "MEMORY_AUTH_TOKEN_PATH",
+            default_auth_token_path(),
         )
     )
     global_db_enabled: bool = field(
@@ -70,8 +83,9 @@ class MemoryConfig:
         )
     )
     global_db_path: Path = field(
-        default_factory=lambda: Path(
-            os.environ.get("MEMORY_GLOBAL_DB_PATH", str(default_global_db_path()))
+        default_factory=lambda: env_path_or_default(
+            "MEMORY_GLOBAL_DB_PATH",
+            default_global_db_path(),
         )
     )
     global_preference_routing_enabled: bool = field(

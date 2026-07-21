@@ -1,4 +1,4 @@
-"""FastMCP server with all 19 memory tools."""
+"""FastMCP server with all 22 memory tools."""
 
 from __future__ import annotations
 
@@ -47,6 +47,24 @@ DESTRUCTIVE_TOOL = ToolAnnotations(
 Scope = Literal["workspace", "global", "all"]
 NonEmptyText = Annotated[str, Field(min_length=1, max_length=16_384)]
 Name = Annotated[str, Field(min_length=1, max_length=512)]
+
+DESTRUCTIVE_SCOPE_ALL_ERROR = (
+    "scope='all' is not supported for destructive operations to prevent unintentional "
+    "data loss. Please specify 'workspace' or 'global'."
+)
+DESTRUCTIVE_TAG_SCOPE_ALL_ERROR = (
+    "scope='all' is not supported for destructive tag action '{action}' to prevent "
+    "unintentional data loss. Please specify 'workspace' or 'global'."
+)
+# manage_tags actions that must not fan out across scopes
+DESTRUCTIVE_TAG_ACTIONS = frozenset({"delete", "untag", "cleanup"})
+
+
+def _destructive_scope_all_error(*, action: str | None = None) -> str:
+    """Return the public-main structured error for rejected scope='all' writes."""
+    if action is not None:
+        return json.dumps({"error": DESTRUCTIVE_TAG_SCOPE_ALL_ERROR.format(action=action)})
+    return json.dumps({"error": DESTRUCTIVE_SCOPE_ALL_ERROR})
 
 
 class StructuredToolResult(BaseModel):
@@ -739,11 +757,11 @@ def create_server(
 
         Set hard=true for permanent deletion.
         """
+        if scope == "all":
+            return _destructive_scope_all_error()
         graph, _, global_graph = _get_ctx(ctx)
-        count = sum(
-            target.delete_entities(entityNames, hard=hard)
-            for _, target in _scope_graphs(graph, global_graph, scope)
-        )
+        targets = _scope_graphs(graph, global_graph, scope)
+        count = sum(target.delete_entities(entityNames, hard=hard) for _, target in targets)
         return json.dumps({"deleted": count})
 
     @mcp.tool(annotations=READ_ONLY_TOOL)
@@ -803,11 +821,11 @@ def create_server(
 
         Each item needs: entityName (str), observations (list[str] of content to delete).
         """
+        if scope == "all":
+            return _destructive_scope_all_error()
         graph, _, global_graph = _get_ctx(ctx)
-        count = sum(
-            target.delete_observations(deletions)
-            for _, target in _scope_graphs(graph, global_graph, scope)
-        )
+        targets = _scope_graphs(graph, global_graph, scope)
+        count = sum(target.delete_observations(deletions) for _, target in targets)
         return json.dumps({"deleted": count})
 
     # ------------------------------------------------------------------
@@ -823,11 +841,11 @@ def create_server(
 
         Each item needs: from (str), to (str), relationType (str).
         """
+        if scope == "all":
+            return _destructive_scope_all_error()
         graph, _, global_graph = _get_ctx(ctx)
-        count = sum(
-            target.delete_relations(relations)
-            for _, target in _scope_graphs(graph, global_graph, scope)
-        )
+        targets = _scope_graphs(graph, global_graph, scope)
+        count = sum(target.delete_relations(relations) for _, target in targets)
         return json.dumps({"deleted": count})
 
     # ------------------------------------------------------------------
@@ -1132,9 +1150,11 @@ def create_server(
         untag: remove tag_name from entity_name.
         cleanup: remove expired ephemeral items.
         """
+        if scope == "all" and action in DESTRUCTIVE_TAG_ACTIONS:
+            return _destructive_scope_all_error(action=action)
         graph_mgr, _, global_graph = _get_ctx(ctx)
         targets = _scope_graphs(graph_mgr, global_graph, scope)
-        if action in {"tag", "untag"} and scope == "all" and entity_name:
+        if action == "tag" and scope == "all" and entity_name:
             owner = _entity_owner(graph_mgr, global_graph, entity_name)
             if owner is None:
                 raise ValueError(f"Entity not found: {entity_name}")
@@ -1204,14 +1224,10 @@ def create_server(
         strategy: 'combine' (move all observations) or 'dedupe' (skip duplicates).
         Relations and tags are transferred. Self-relations are removed.
         """
+        if scope == "all":
+            return _destructive_scope_all_error()
         graph_mgr, _, global_graph = _get_ctx(ctx)
         targets = _scope_graphs(graph_mgr, global_graph, scope)
-        if scope == "all":
-            source_owner = _entity_owner(graph_mgr, global_graph, source)
-            target_owner = _entity_owner(graph_mgr, global_graph, target)
-            if source_owner is None or target_owner is None or source_owner[0] != target_owner[0]:
-                raise ValueError("merge entities must exist in the same scope")
-            targets = [source_owner]
         result = targets[0][1].merge_entities(source, target, strategy)
         if result:
             return json.dumps(result.to_dict(), indent=2)
@@ -1265,7 +1281,9 @@ def create_server(
         Compatible with old @modelcontextprotocol/server-memory JSONL files.
         Skips duplicate entities. Skips relations to missing entities.
         """
-        if len(data.encode("utf-8")) > 50 * 1024 * 1024:
+        # Character length is a cheap upper bound; UTF-8 can only be shorter or equal
+        # for pure ASCII and at most 4x for worst-case code points.
+        if len(data) > 50 * 1024 * 1024:
             raise ValueError("import payload exceeds 50 MiB limit")
         graph_mgr, _, global_graph = _get_ctx(ctx)
         parsed: Any = None
@@ -1306,9 +1324,7 @@ def create_server(
                 raise
             return json.dumps({"imported_scopes": sorted(requested)})
         if scope == "all":
-            raise ValueError(
-                "legacy JSON/JSONL import requires scope='workspace' or scope='global'"
-            )
+            return _destructive_scope_all_error()
         target = _scope_graphs(graph_mgr, global_graph, scope)[0][1]
         counts = target.import_graph(data)
         return json.dumps(counts)

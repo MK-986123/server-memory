@@ -4,11 +4,33 @@ import asyncio
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 from server_memory import server as server_module
 from server_memory.config import MemoryConfig
 from server_memory.db import Database
 from server_memory.graph import KnowledgeGraphManager
+
+
+def _tool_ctx(
+    workspace_graph: KnowledgeGraphManager,
+    config: MemoryConfig,
+    global_graph: KnowledgeGraphManager | None = None,
+):
+    return SimpleNamespace(
+        request_context=SimpleNamespace(
+            lifespan_context={
+                "graph": workspace_graph,
+                "global_graph": global_graph,
+                "config": config,
+            }
+        )
+    )
+
+
+def _tool_fn(name: str):
+    server = server_module.create_server(MemoryConfig(global_db_enabled=False))
+    return server._tool_manager._tools[name].fn
 
 
 def test_mcp_tools_advertise_safety_and_bounded_contracts():
@@ -1085,3 +1107,225 @@ def test_benchmark_telemetry_is_opt_in_and_local(monkeypatch, tmp_path):
 
     events = [json.loads(line)["event"] for line in telemetry.read_text().splitlines()]
     assert events == ["mcp_handshake", "tool_call"]
+
+
+def _seed_entity(graph: KnowledgeGraphManager, name: str, *, obs: str = "note") -> None:
+    graph.create_entities(
+        [
+            {
+                "name": name,
+                "entityType": "note",
+                "observations": [obs],
+            }
+        ]
+    )
+
+
+def test_destructive_operations_prevent_scope_all_without_mutation(tmp_path):
+    """scope='all' must return the public structured error and mutate nothing."""
+    workspace_db = Database(tmp_path / "workspace.db")
+    global_db = Database(tmp_path / "global.db")
+    workspace_db.open()
+    global_db.open()
+    try:
+        workspace_graph = KnowledgeGraphManager(workspace_db, session_id="workspace")
+        global_graph = KnowledgeGraphManager(global_db, session_id="global")
+        _seed_entity(workspace_graph, "W", obs="workspace-obs")
+        _seed_entity(global_graph, "G", obs="global-obs")
+        workspace_graph.create_entities([{"name": "W2", "entityType": "note"}])
+        workspace_graph.create_relations(
+            [{"from": "W", "to": "W2", "relationType": "related_to"}]
+        )
+        global_graph.create_entities([{"name": "G2", "entityType": "note"}])
+        global_graph.create_relations(
+            [{"from": "G", "to": "G2", "relationType": "related_to"}]
+        )
+        workspace_graph.create_tag("user-tag")
+        global_graph.create_tag("user-tag")
+        workspace_graph.tag_entity("W", "user-tag")
+        global_graph.tag_entity("G", "user-tag")
+
+        config = MemoryConfig(
+            db_path=tmp_path / "workspace.db",
+            global_db_path=tmp_path / "global.db",
+            embedding_enabled=False,
+        )
+        ctx = _tool_ctx(workspace_graph, config, global_graph)
+
+        def active_counts(graph: KnowledgeGraphManager) -> tuple[int, int, int]:
+            cx = graph.db.cx
+            entities = cx.execute(
+                "SELECT COUNT(*) c FROM entities WHERE deleted_at IS NULL"
+            ).fetchone()["c"]
+            observations = cx.execute(
+                "SELECT COUNT(*) c FROM observations WHERE deleted_at IS NULL"
+            ).fetchone()["c"]
+            relations = cx.execute(
+                "SELECT COUNT(*) c FROM relations WHERE deleted_at IS NULL"
+            ).fetchone()["c"]
+            return entities, observations, relations
+
+        before_w = active_counts(workspace_graph)
+        before_g = active_counts(global_graph)
+
+        cases = [
+            ("delete_entities", {"entityNames": ["W", "G"], "hard": False}),
+            ("delete_entities", {"entityNames": ["W", "G"], "hard": True}),
+            (
+                "delete_observations",
+                {
+                    "deletions": [
+                        {"entityName": "W", "observations": ["workspace-obs"]},
+                        {"entityName": "G", "observations": ["global-obs"]},
+                    ]
+                },
+            ),
+            (
+                "delete_relations",
+                {
+                    "relations": [
+                        {"from": "W", "to": "W2", "relationType": "related_to"},
+                        {"from": "G", "to": "G2", "relationType": "related_to"},
+                    ]
+                },
+            ),
+            ("merge_entities", {"source": "W", "target": "W2"}),
+            ("manage_tags", {"action": "delete", "name": "user-tag"}),
+            ("manage_tags", {"action": "cleanup"}),
+            ("manage_tags", {"action": "untag", "entity_name": "W", "tag_name": "user-tag"}),
+            (
+                "import_graph",
+                {"data": json.dumps({"entities": [], "relations": []})},
+            ),
+        ]
+
+        for tool_name, kwargs in cases:
+            res = _tool_fn(tool_name)(ctx, scope="all", **kwargs)
+            payload = json.loads(res)
+            assert "error" in payload, tool_name
+            if tool_name == "manage_tags":
+                assert "scope='all' is not supported for destructive tag action" in payload["error"]
+            else:
+                assert "scope='all' is not supported for destructive operations" in payload["error"]
+            assert active_counts(workspace_graph) == before_w
+            assert active_counts(global_graph) == before_g
+            assert workspace_graph.get_entity_by_name("W") is not None
+            assert global_graph.get_entity_by_name("G") is not None
+    finally:
+        global_db.close()
+        workspace_db.close()
+
+
+def test_destructive_operations_succeed_for_workspace_and_global(tmp_path):
+    workspace_db = Database(tmp_path / "workspace.db")
+    global_db = Database(tmp_path / "global.db")
+    workspace_db.open()
+    global_db.open()
+    try:
+        workspace_graph = KnowledgeGraphManager(workspace_db, session_id="workspace")
+        global_graph = KnowledgeGraphManager(global_db, session_id="global")
+        for graph, prefix in ((workspace_graph, "W"), (global_graph, "G")):
+            _seed_entity(graph, f"{prefix}-keep", obs=f"{prefix}-obs")
+            _seed_entity(graph, f"{prefix}-soft", obs=f"{prefix}-soft-obs")
+            _seed_entity(graph, f"{prefix}-hard", obs=f"{prefix}-hard-obs")
+            graph.create_entities([{"name": f"{prefix}-rel", "entityType": "note"}])
+            graph.create_relations(
+                [
+                    {
+                        "from": f"{prefix}-keep",
+                        "to": f"{prefix}-rel",
+                        "relationType": "related_to",
+                    }
+                ]
+            )
+
+        config = MemoryConfig(
+            db_path=tmp_path / "workspace.db",
+            global_db_path=tmp_path / "global.db",
+            embedding_enabled=False,
+        )
+        ctx = _tool_ctx(workspace_graph, config, global_graph)
+
+        for scope, graph, prefix in (
+            ("workspace", workspace_graph, "W"),
+            ("global", global_graph, "G"),
+        ):
+            soft = json.loads(
+                _tool_fn("delete_entities")(
+                    ctx, entityNames=[f"{prefix}-soft"], hard=False, scope=scope
+                )
+            )
+            assert soft["deleted"] == 1
+            assert graph.get_entity_by_name(f"{prefix}-soft") is None
+            hard = json.loads(
+                _tool_fn("delete_entities")(
+                    ctx, entityNames=[f"{prefix}-hard"], hard=True, scope=scope
+                )
+            )
+            assert hard["deleted"] == 1
+            row = graph.db.cx.execute(
+                "SELECT 1 FROM entities WHERE name = ?", (f"{prefix}-hard",)
+            ).fetchone()
+            assert row is None
+
+            obs = json.loads(
+                _tool_fn("delete_observations")(
+                    ctx,
+                    deletions=[
+                        {
+                            "entityName": f"{prefix}-keep",
+                            "observations": [f"{prefix}-obs"],
+                        }
+                    ],
+                    scope=scope,
+                )
+            )
+            assert obs["deleted"] == 1
+
+            rel = json.loads(
+                _tool_fn("delete_relations")(
+                    ctx,
+                    relations=[
+                        {
+                            "from": f"{prefix}-keep",
+                            "to": f"{prefix}-rel",
+                            "relationType": "related_to",
+                        }
+                    ],
+                    scope=scope,
+                )
+            )
+            assert rel["deleted"] == 1
+
+            graph.create_entities(
+                [
+                    {"name": f"{prefix}-src", "entityType": "note"},
+                    {"name": f"{prefix}-dst", "entityType": "note"},
+                ]
+            )
+            merged = json.loads(
+                _tool_fn("merge_entities")(
+                    ctx,
+                    source=f"{prefix}-src",
+                    target=f"{prefix}-dst",
+                    scope=scope,
+                )
+            )
+            assert merged["name"] == f"{prefix}-dst"
+            assert graph.get_entity_by_name(f"{prefix}-src") is None
+
+            graph.create_tag(f"{prefix}-tag")
+            deleted_tag = json.loads(
+                _tool_fn("manage_tags")(
+                    ctx, action="delete", name=f"{prefix}-tag", scope=scope
+                )
+            )
+            assert deleted_tag["deleted"] is True
+
+            cleaned = json.loads(
+                _tool_fn("manage_tags")(ctx, action="cleanup", scope=scope)
+            )
+            assert "cleaned" in cleaned
+    finally:
+        global_db.close()
+        workspace_db.close()
