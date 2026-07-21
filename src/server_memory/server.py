@@ -1,23 +1,30 @@
-"""FastMCP server with all 20 memory tools."""
+"""FastMCP server with all 19 memory tools."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from typing_extensions import NotRequired, TypedDict
 
-from .compression import compress_graph
+from .compression import _enforce_budget, compress_graph
 from .config import MemoryConfig
 from .db import Database
 from .embeddings import EmbeddingEngine
 from .graph import KnowledgeGraphManager
 from .local_auth import LocalTokenVerifier, build_local_auth_settings, ensure_local_auth_token
+from .models import KnowledgeGraph
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +33,95 @@ _startup_cleanup_started = False
 
 PREFERENCE_TAG = "preference"
 WORKSPACE_MEMORY_SCORE_BONUS = 0.2
+
+READ_ONLY_TOOL = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+WRITE_TOOL = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+DESTRUCTIVE_TOOL = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
+
 Scope = Literal["workspace", "global", "all"]
+NonEmptyText = Annotated[str, Field(min_length=1, max_length=16_384)]
+Name = Annotated[str, Field(min_length=1, max_length=512)]
+
+
+class StructuredToolResult(BaseModel):
+    """Protocol result with exact legacy text plus machine-readable JSON when available."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    data: JsonValue | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def from_legacy_text(cls, value: Any) -> Any:
+        # Tool functions intentionally keep returning their established strings.
+        # FastMCP applies this adapter only at the protocol boundary, preserving
+        # direct Python callers while advertising and emitting structuredContent.
+        if not isinstance(value, str):
+            return value
+        try:
+            data: JsonValue | None = json.loads(value)
+        except json.JSONDecodeError:
+            data = None
+        return {"text": value, "data": data}
+
+
+class EntityInput(TypedDict):
+    name: Name
+    entityType: str
+    observations: NotRequired[Annotated[list[NonEmptyText], Field(max_length=500)]]
+    tags: NotRequired[Annotated[list[Name], Field(max_length=100)]]
+    metadata: NotRequired[dict[str, Any]]
+
+
+EntityInput.__pydantic_config__ = ConfigDict(extra="forbid")
+
+
+RelationInput = TypedDict(
+    "RelationInput",
+    {
+        "from": Name,
+        "to": Name,
+        "relationType": Name,
+        "weight": NotRequired[Annotated[float, Field(ge=0.0, le=1.0)]],
+        "tags": NotRequired[Annotated[list[Name], Field(max_length=100)]],
+    },
+)
+RelationInput.__pydantic_config__ = ConfigDict(extra="forbid")
+
+
+class ObservationInput(TypedDict):
+    entityName: Name
+    contents: Annotated[list[NonEmptyText], Field(min_length=1, max_length=500)]
+    source: NotRequired[Annotated[str, Field(max_length=2_048)]]
+    confidence: NotRequired[Annotated[float, Field(ge=0.0, le=1.0)]]
+    importance: NotRequired[Annotated[float, Field(ge=0.0, le=1.0)]]
+    obs_type: NotRequired[Annotated[str, Field(max_length=128)]]
+    tags: NotRequired[Annotated[list[Name], Field(max_length=100)]]
+
+
+ObservationInput.__pydantic_config__ = ConfigDict(extra="forbid")
+
+
+class ObservationDeletionInput(TypedDict):
+    entityName: Name
+    observations: Annotated[list[NonEmptyText], Field(min_length=1, max_length=500)]
+
+
+ObservationDeletionInput.__pydantic_config__ = ConfigDict(extra="forbid")
+
+
+RelationDeletionInput = TypedDict(
+    "RelationDeletionInput",
+    {"from": Name, "to": Name, "relationType": Name},
+)
+RelationDeletionInput.__pydantic_config__ = ConfigDict(extra="forbid")
 
 INSTRUCTIONS = (
     "Memory server for persistent knowledge across conversations.\n"
@@ -38,8 +133,103 @@ INSTRUCTIONS = (
 )
 
 
+def _record_benchmark_event(event: str) -> None:
+    """Record opt-in local treatment evidence without affecting normal service."""
+    telemetry_path = os.environ.get("MEMORY_BENCHMARK_TELEMETRY_PATH", "")
+    if not telemetry_path:
+        return
+    path = Path(telemetry_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"event": event, "timestamp": datetime.now(timezone.utc).isoformat()}
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload) + "\n")
+
+
+def _page_cursor(offset: int, fingerprint: str) -> str:
+    payload = json.dumps({"offset": offset, "fingerprint": fingerprint}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _cursor_offset(cursor: str, fingerprint: str) -> int:
+    if not cursor:
+        return 0
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        offset = int(payload["offset"])
+        if payload["fingerprint"] != fingerprint or offset < 0:
+            raise ValueError
+        return offset
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid or mismatched pagination cursor") from exc
+
+
+def _fingerprint_cursor(tool: str, arguments: dict[str, Any]) -> str:
+    encoded = json.dumps([tool, arguments], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def _resolve_backup_path(
+    db_path: str | Path,
+    dest_path: str,
+    *,
+    scope_name: str,
+    multiple_scopes: bool,
+    timestamp: str,
+) -> Path:
+    """Resolve a no-clobber backup path beneath a real, non-symlink backup root."""
+    db_parent = Path(db_path).expanduser().resolve().parent
+    configured_root = db_parent / "backups"
+    if configured_root.is_symlink():
+        raise ValueError("backup root must not be a symlink")
+    allowed_root = configured_root.resolve(strict=False)
+
+    if dest_path:
+        requested = Path(dest_path).expanduser()
+        candidate = (
+            requested / f"{scope_name}-{timestamp}.db"
+            if multiple_scopes or requested.suffix == ""
+            else requested
+        )
+    else:
+        candidate = allowed_root / f"{scope_name}-{timestamp}.db"
+    backup_path = candidate.resolve(strict=False)
+
+    if allowed_root != backup_path.parent and allowed_root not in backup_path.parents:
+        raise ValueError(f"backup destination must be under {allowed_root}")
+    if backup_path.exists() or backup_path.is_symlink():
+        raise ValueError(f"backup destination already exists: {backup_path}")
+    return backup_path
+
+
+def _paginate_graph(
+    graph: KnowledgeGraph,
+    *,
+    page_size: int,
+    cursor: str,
+    fingerprint: str,
+) -> tuple[KnowledgeGraph, str]:
+    """Return a deterministic page and an opaque cursor bound to its query."""
+    offset = _cursor_offset(cursor, fingerprint)
+    entities = graph.entities[offset : offset + page_size]
+    names = {(entity.scope, entity.name) for entity in entities}
+    relations = [
+        relation
+        for relation in graph.relations
+        if (relation.scope, relation.from_name) in names
+        and (relation.scope, relation.to_name) in names
+    ]
+    next_offset = offset + len(entities)
+    next_cursor = (
+        _page_cursor(next_offset, fingerprint) if next_offset < len(graph.entities) else ""
+    )
+    return KnowledgeGraph(entities=entities, relations=relations), next_cursor
+
+
 def _run_startup_cleanup(cfg: MemoryConfig) -> None:
-    """Run non-critical cleanup outside the MCP handshake path."""
+    """Expire only explicitly ephemeral records outside the MCP handshake path."""
+    if not cfg.retention_cleanup_enabled:
+        return
     cleanup_db = Database(cfg.db_path)
     try:
         cfg.ensure_db_dir()
@@ -49,13 +239,6 @@ def _run_startup_cleanup(cfg: MemoryConfig) -> None:
         if cleaned:
             logger.info("Cleaned up %d expired items", cleaned)
 
-        unused_cleaned = cleanup_db.cleanup_unused(days=30)
-        if unused_cleaned:
-            logger.info("Cleaned up %d unused items", unused_cleaned)
-
-        empty_cleaned = cleanup_db.cleanup_empty_stale(days=7)
-        if empty_cleaned:
-            logger.info("Cleaned up %d empty stale entities", empty_cleaned)
     except Exception as e:
         logger.warning("Background startup cleanup skipped: %s", e)
     finally:
@@ -84,11 +267,11 @@ def _format_memory_context_result(result: dict[str, Any]) -> str:
     """Render compact memory_context output from graph-layer match metadata."""
     lines = []
     if result["pinned"]:
-        pinned_parts = []
-        for p in result["pinned"]:
-            src = f" ({p['source']})" if p.get("source") else ""
-            pinned_parts.append(f"{p['name']}[{p['type']}{src}]")
-        pinned_str = ", ".join(pinned_parts)
+        pinned_str = ", ".join(
+            f"{p['name']}[{p['type']}]"
+            + (f"@{p['source']}" if p.get("source") else "")
+            for p in result["pinned"]
+        )
         lines.append(f"Pinned: {pinned_str}")
     if result["recent_activity"]:
         acts = [f"{a['action']}:{a['summary']}" for a in result["recent_activity"]]
@@ -96,8 +279,9 @@ def _format_memory_context_result(result: dict[str, Any]) -> str:
     if result["hint_matches"]:
         hint_parts = []
         for h in result["hint_matches"]:
-            src = f" ({h['source']})" if h.get("source") else ""
-            part = f"{h['name']}[{h['type']}{src}]"
+            part = f"{h['name']}[{h['type']}]"
+            if h.get("source"):
+                part += f"@{h['source']}"
             snippets = h.get("snippets", [])
             if snippets:
                 part += ': "' + '" | "'.join(snippets) + '"'
@@ -139,10 +323,18 @@ def _merge_activity_entries(
 ) -> list[dict[str, Any]]:
     """Merge activity rows while preserving order and removing duplicates."""
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
 
-    for entry in [*workspace_activity, *global_activity]:
-        key = (entry.get("action", ""), entry.get("summary", ""))
+    ordered = sorted(
+        [
+            *(dict(entry, source="workspace") for entry in workspace_activity),
+            *(dict(entry, source="global") for entry in global_activity),
+        ],
+        key=lambda entry: str(entry.get("at", entry.get("created_at", ""))),
+        reverse=True,
+    )
+    for entry in ordered:
+        key = (entry.get("source", ""), entry.get("action", ""), entry.get("summary", ""))
         if key in seen:
             continue
         seen.add(key)
@@ -191,26 +383,15 @@ def merge_memory_context_results(
 ) -> dict[str, Any]:
     """Merge workspace-local and global preference context into one response."""
     if not global_result:
-        for item in workspace_result.get("pinned", []):
-            item.setdefault("source", "workspace")
-        for item in workspace_result.get("hint_matches", []):
-            item.setdefault("source", "workspace")
         return workspace_result
 
-    # Ensure source is labeled
+    pinned_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
     for item in workspace_result.get("pinned", []):
-        item.setdefault("source", "workspace")
+        candidate = dict(item, source="workspace")
+        pinned_by_identity[("workspace", item.get("name", ""), item.get("type", ""))] = candidate
     for item in global_result.get("pinned", []):
-        item.setdefault("source", "global")
-
-    pinned_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {
-        (item.get("source", "workspace"), item.get("name", ""), item.get("type", "")): item
-        for item in workspace_result.get("pinned", [])
-    }
-    for item in global_result.get("pinned", []):
-        pinned_by_identity.setdefault(
-            (item.get("source", "global"), item.get("name", ""), item.get("type", "")), item
-        )
+        candidate = dict(item, source="global")
+        pinned_by_identity[("global", item.get("name", ""), item.get("type", ""))] = candidate
 
     workspace_stats = workspace_result.get("stats", {})
     global_stats = global_result.get("stats", {})
@@ -238,37 +419,6 @@ def merge_memory_context_results(
     }
 
 
-def _normalize_scope(scope: str) -> Scope:
-    normalized = scope.strip().lower()
-    if normalized in {"workspace", "global", "all"}:
-        return normalized  # type: ignore[return-value]
-    raise ValueError("scope must be one of: workspace, global, all")
-
-
-def _scoped_graphs(
-    graph_mgr: KnowledgeGraphManager,
-    global_graph_mgr: KnowledgeGraphManager | None,
-    scope: str,
-) -> list[tuple[str, KnowledgeGraphManager]]:
-    """Resolve a scope into deterministic graph targets."""
-    normalized = _normalize_scope(scope)
-    if normalized == "workspace":
-        return [("workspace", graph_mgr)]
-    if normalized == "global":
-        return [("global", global_graph_mgr)] if global_graph_mgr is not None else []
-    targets = [("workspace", graph_mgr)]
-    if global_graph_mgr is not None:
-        targets.append(("global", global_graph_mgr))
-    return targets
-
-
-def _scope_error(scope: str) -> str:
-    return json.dumps({"error": f"No database available for scope '{scope}'"})
-
-
-def _source_wrapped(source: str, payload: Any) -> dict[str, Any]:
-    return {"source": source, "result": payload}
-
 
 def _safe_close_db(database: Database | None, has_active_exc: bool) -> None:
     if database is None:
@@ -277,14 +427,18 @@ def _safe_close_db(database: Database | None, has_active_exc: bool) -> None:
         database.close()
     except Exception as exc:
         if has_active_exc:
-            logger.error("Suppressing database close error because another exception is active: %s", exc)
+            logger.error(
+                "Suppressing database close error because another exception is active: %s",
+                exc,
+            )
         else:
             raise
 
 
 def _close_lifespan_databases(db: Database | None, global_db: Database | None) -> None:
-    """Close lifespan databases safely, ensuring both are closed and exceptions are handled correctly."""
+    """Close lifespan databases safely, ensuring both are closed."""
     import sys
+
     has_active_exc = sys.exc_info()[1] is not None
     try:
         if global_db is not None:
@@ -315,55 +469,58 @@ def create_server(
     @asynccontextmanager
     async def lifespan(server: FastMCP):
         cfg.ensure_db_dir()
-        db = Database(cfg.db_path)
+        db = Database(cfg.db_path, write_timeout_seconds=cfg.write_timeout_ms / 1000)
         db.open()
 
         global_db: Database | None = None
-        try:
-            global_graph_mgr: KnowledgeGraphManager | None = None
-            use_global_db = cfg.global_db_enabled and cfg.global_db_path != cfg.db_path
-            if use_global_db:
-                cfg.ensure_global_db_dir()
-                g_db = Database(cfg.global_db_path)
-                g_db.open()
-                global_db = g_db
+        global_graph_mgr: KnowledgeGraphManager | None = None
+        use_global_db = cfg.global_db_enabled and cfg.global_db_path != cfg.db_path
+        if use_global_db:
+            cfg.ensure_global_db_dir()
+            global_db = Database(
+                cfg.global_db_path,
+                write_timeout_seconds=cfg.write_timeout_ms / 1000,
+            )
+            global_db.open()
 
-            # Create embedding engine if enabled
-            embedding_engine: EmbeddingEngine | None = None
-            if cfg.embedding_enabled:
-                embedding_engine = EmbeddingEngine(model_name=cfg.embedding_model)
+        # Create embedding engine if enabled
+        embedding_engine: EmbeddingEngine | None = None
+        if cfg.embedding_enabled:
+            embedding_engine = EmbeddingEngine(model_name=cfg.embedding_model)
 
-            graph_mgr = KnowledgeGraphManager(
-                db,
+        graph_mgr = KnowledgeGraphManager(
+            db,
+            session_id=cfg.session_id or "",
+            embedding_engine=embedding_engine,
+            project=cfg.project,
+            dedup_threshold=cfg.dedup_threshold,
+            write_embedding_budget_ms=cfg.write_embedding_budget_ms,
+        )
+
+        if global_db is not None:
+            global_graph_mgr = KnowledgeGraphManager(
+                global_db,
                 session_id=cfg.session_id or "",
                 embedding_engine=embedding_engine,
-                project=cfg.project,
+                project="",
                 dedup_threshold=cfg.dedup_threshold,
                 write_embedding_budget_ms=cfg.write_embedding_budget_ms,
             )
 
-            if global_db is not None:
-                global_graph_mgr = KnowledgeGraphManager(
-                    global_db,
-                    session_id=cfg.session_id or "",
-                    embedding_engine=embedding_engine,
-                    project="",
-                    dedup_threshold=cfg.dedup_threshold,
-                    write_embedding_budget_ms=cfg.write_embedding_budget_ms,
-                )
+        # Import from old server if requested
+        if cfg.import_jsonl:
+            try:
+                with open(cfg.import_jsonl) as f:
+                    data = f.read()
+                counts = graph_mgr.import_graph(data)
+                logger.info("Imported from JSONL: %s", counts)
+            except Exception as e:
+                logger.error("Failed to import JSONL: %s", e)
 
-            # Import from old server if requested
-            if cfg.import_jsonl:
-                try:
-                    with open(cfg.import_jsonl) as f:
-                        data = f.read()
-                    counts = graph_mgr.import_graph(data)
-                    logger.info("Imported from JSONL: %s", counts)
-                except Exception as e:
-                    logger.error("Failed to import JSONL: %s", e)
+        _schedule_startup_cleanup(cfg)
 
-            _schedule_startup_cleanup(cfg)
-
+        _record_benchmark_event("mcp_handshake")
+        try:
             yield {
                 "db": db,
                 "graph": graph_mgr,
@@ -387,18 +544,76 @@ def create_server(
     def _get_ctx(
         ctx: Context,
     ) -> tuple[KnowledgeGraphManager, MemoryConfig, KnowledgeGraphManager | None]:
+        _record_benchmark_event("tool_call")
         lifespan_ctx = ctx.request_context.lifespan_context
         return lifespan_ctx["graph"], lifespan_ctx["config"], lifespan_ctx.get("global_graph")
+
+    def _scope_graphs(
+        workspace_graph: KnowledgeGraphManager,
+        global_graph: KnowledgeGraphManager | None,
+        scope: str,
+    ) -> list[tuple[str, KnowledgeGraphManager]]:
+        if scope not in {"workspace", "global", "all"}:
+            raise ValueError("scope must be 'workspace', 'global', or 'all'")
+        if scope == "workspace":
+            return [("workspace", workspace_graph)]
+        if global_graph is None:
+            if scope == "global":
+                raise ValueError("global memory scope is disabled")
+            return [("workspace", workspace_graph)]
+        if scope == "global":
+            return [("global", global_graph)]
+        return [("workspace", workspace_graph), ("global", global_graph)]
+
+    def _entity_owner(
+        workspace_graph: KnowledgeGraphManager,
+        global_graph: KnowledgeGraphManager | None,
+        name: str,
+        *,
+        scope: str = "all",
+        include_deleted: bool = False,
+    ) -> tuple[str, KnowledgeGraphManager] | None:
+        matches: list[tuple[str, KnowledgeGraphManager]] = []
+        for scope_name, candidate in _scope_graphs(workspace_graph, global_graph, scope):
+            if include_deleted:
+                row = candidate.db.cx.execute(
+                    "SELECT 1 FROM entities WHERE name = ?", (name,)
+                ).fetchone()
+                if row:
+                    matches.append((scope_name, candidate))
+            elif candidate.get_entity_by_name(name) is not None:
+                matches.append((scope_name, candidate))
+        if len(matches) > 1:
+            raise ValueError(
+                f"Entity '{name}' exists in multiple scopes; specify scope='workspace' or 'global'"
+            )
+        return matches[0] if matches else None
+
+    def _merge_graphs(graphs: list[KnowledgeGraph]) -> KnowledgeGraph:
+        return KnowledgeGraph(
+            entities=[entity for graph in graphs for entity in graph.entities],
+            relations=[relation for graph in graphs for relation in graph.relations],
+        )
+
+    def _merge_scoped_graphs(
+        graphs: list[tuple[str, KnowledgeGraph]],
+    ) -> KnowledgeGraph:
+        for scope_name, scoped_graph in graphs:
+            for entity in scoped_graph.entities:
+                entity.scope = scope_name
+            for relation in scoped_graph.relations:
+                relation.scope = scope_name
+        return _merge_graphs([graph for _, graph in graphs])
 
     # ------------------------------------------------------------------
     # Tool 1: create_entities
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=WRITE_TOOL)
     def create_entities(
         ctx: Context,
-        entities: list[dict[str, Any]],
-        scope: str = "workspace",
-    ) -> str:
+        entities: Annotated[list[EntityInput], Field(min_length=1, max_length=500)],
+        scope: Scope = "all",
+    ) -> StructuredToolResult:
         """Create new entities in the knowledge graph.
 
         Each entity needs: name (str), entityType (str).
@@ -406,22 +621,15 @@ def create_server(
         Skips duplicates by name.
         """
         graph, cfg, global_graph = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
-        if normalized_scope == "global":
-            if global_graph is None:
-                return _scope_error(scope)
-            created = global_graph.create_entities(entities)
-            return json.dumps([e.to_dict() for e in created], indent=2)
-        if normalized_scope == "all":
-            results = []
-            for source, target_graph in _scoped_graphs(graph, global_graph, scope):
-                created = target_graph.create_entities(entities)
-                results.append(_source_wrapped(source, [e.to_dict() for e in created]))
-            return json.dumps(results, indent=2)
-
+        _scope_graphs(graph, global_graph, scope)
         workspace_entities = entities
         global_entities: list[dict[str, Any]] = []
-        if cfg.global_preference_routing_enabled and global_graph is not None:
+        if scope == "global":
+            workspace_entities = []
+            global_entities = entities
+        elif scope == "workspace":
+            workspace_entities = entities
+        elif cfg.global_preference_routing_enabled and global_graph is not None:
             workspace_entities = []
             for entity in entities:
                 if _is_preference_entity(entity):
@@ -439,12 +647,12 @@ def create_server(
     # ------------------------------------------------------------------
     # Tool 2: create_relations
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=WRITE_TOOL)
     def create_relations(
         ctx: Context,
-        relations: list[dict[str, Any]],
-        scope: str = "workspace",
-    ) -> str:
+        relations: Annotated[list[RelationInput], Field(min_length=1, max_length=500)],
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Create relations between entities.
 
         Each relation needs: from (str), to (str), relationType (str).
@@ -453,29 +661,36 @@ def create_server(
         """
         graph, _, global_graph = _get_ctx(ctx)
         try:
-            targets = _scoped_graphs(graph, global_graph, scope)
-            if not targets:
-                return _scope_error(scope)
-            if len(targets) == 1:
+            targets = _scope_graphs(graph, global_graph, scope)
+            if scope == "all":
+                grouped: dict[str, list[dict[str, Any]]] = {"workspace": [], "global": []}
+                for relation in relations:
+                    from_owner = _entity_owner(graph, global_graph, relation["from"], scope=scope)
+                    to_owner = _entity_owner(graph, global_graph, relation["to"], scope=scope)
+                    if from_owner is None or to_owner is None:
+                        raise ValueError("relation endpoint not found")
+                    if from_owner[0] != to_owner[0]:
+                        raise ValueError("cross-scope relations are not supported")
+                    grouped[from_owner[0]].append(relation)
+                created = []
+                for scope_name, target in targets:
+                    if grouped[scope_name]:
+                        created.extend(target.create_relations(grouped[scope_name]))
+            else:
                 created = targets[0][1].create_relations(relations)
-                return json.dumps([r.to_dict() for r in created], indent=2)
-            results = []
-            for source, target_graph in targets:
-                created = target_graph.create_relations(relations)
-                results.append(_source_wrapped(source, [r.to_dict() for r in created]))
-            return json.dumps(results, indent=2)
+            return json.dumps([r.to_dict() for r in created], indent=2)
         except ValueError as e:
-            return json.dumps({"error": str(e)})
+            raise ValueError(str(e)) from e
 
     # ------------------------------------------------------------------
     # Tool 3: add_observations
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=WRITE_TOOL)
     def add_observations(
         ctx: Context,
-        observations: list[dict[str, Any]],
-        scope: str = "workspace",
-    ) -> str:
+        observations: Annotated[list[ObservationInput], Field(min_length=1, max_length=500)],
+        scope: Scope = "all",
+    ) -> StructuredToolResult:
         """Add observations to existing entities.
 
         Each item needs: entityName (str), contents (list[str]).
@@ -487,28 +702,19 @@ def create_server(
         Protected obs_types (api_endpoint, dependency, file_path, code_snippet,
         config, schema) always survive compression.
         """
-        graph, cfg, global_graph = _get_ctx(ctx)
+        graph, _, global_graph = _get_ctx(ctx)
         try:
-            normalized_scope = _normalize_scope(scope)
-            if normalized_scope == "global":
-                if global_graph is None:
-                    return _scope_error(scope)
-                return json.dumps(global_graph.add_observations(observations), indent=2)
-            if normalized_scope == "all":
-                results = []
-                for source, target_graph in _scoped_graphs(graph, global_graph, scope):
-                    results.append(_source_wrapped(source, target_graph.add_observations(observations)))
-                return json.dumps(results, indent=2)
-
-            workspace_observations = observations
+            workspace_observations: list[dict[str, Any]] = []
             global_observations: list[dict[str, Any]] = []
-            if cfg.global_preference_routing_enabled and global_graph is not None:
-                workspace_observations = []
-                for observation in observations:
-                    if _is_preference_observation(observation):
-                        global_observations.append(observation)
-                    else:
-                        workspace_observations.append(observation)
+            for observation in observations:
+                name = str(observation.get("entityName", ""))
+                owner = _entity_owner(graph, global_graph, name, scope=scope)
+                if owner is None:
+                    raise ValueError(f"Entity not found: {name}")
+                if owner[0] == "global":
+                    global_observations.append(observation)
+                else:
+                    workspace_observations.append(observation)
 
             results = []
             if workspace_observations:
@@ -517,239 +723,290 @@ def create_server(
                 results.extend(global_graph.add_observations(global_observations))
             return json.dumps(results, indent=2)
         except ValueError as e:
-            return json.dumps({"error": str(e)})
+            raise ValueError(str(e)) from e
 
     # ------------------------------------------------------------------
     # Tool 4: delete_entities
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE_TOOL)
     def delete_entities(
         ctx: Context,
-        entityNames: list[str],
+        entityNames: Annotated[list[Name], Field(min_length=1, max_length=500)],
         hard: bool = False,
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Delete entities (soft delete by default, cascades to relations).
 
         Set hard=true for permanent deletion.
         """
         graph, _, global_graph = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
-        if normalized_scope == "all":
-            return json.dumps({"error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
-        targets = _scoped_graphs(graph, global_graph, scope)
-        if not targets:
-            return _scope_error(scope)
-        if len(targets) == 1:
-            count = targets[0][1].delete_entities(entityNames, hard=hard)
-            return json.dumps({"deleted": count})
-        results = [
-            {"source": source, "deleted": target_graph.delete_entities(entityNames, hard=hard)}
-            for source, target_graph in targets
+        count = sum(
+            target.delete_entities(entityNames, hard=hard)
+            for _, target in _scope_graphs(graph, global_graph, scope)
+        )
+        return json.dumps({"deleted": count})
+
+    @mcp.tool(annotations=READ_ONLY_TOOL)
+    def list_deleted_entities(
+        ctx: Context,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 100,
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
+        """List soft-deleted workspace entities that can be restored.
+
+        Results are ordered newest deletion first. Limit must be 1-1000.
+        """
+        graph, _, global_graph = _get_ctx(ctx)
+        scoped_entities = [
+            (scope_name, entity)
+            for scope_name, target in _scope_graphs(graph, global_graph, scope)
+            for entity in target.list_deleted_entities(limit=limit)
         ]
-        return json.dumps(results, indent=2)
+        scoped_entities.sort(key=lambda item: (item[1].deleted_at or "", item[1].id), reverse=True)
+        return json.dumps(
+            [
+                {
+                    **entity.to_dict(),
+                    "scope": scope_name,
+                    "deletedAt": entity.deleted_at,
+                    "updatedAt": entity.updated_at,
+                }
+                for scope_name, entity in scoped_entities[:limit]
+            ],
+            indent=2,
+        )
+
+    @mcp.tool(annotations=WRITE_TOOL)
+    def restore_entities(
+        ctx: Context,
+        entityNames: Annotated[list[Name], Field(min_length=1, max_length=500)],
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
+        """Restore soft-deleted workspace entities and safe associated relations."""
+        graph, _, global_graph = _get_ctx(ctx)
+        count = sum(
+            target.restore_entities(entityNames)
+            for _, target in _scope_graphs(graph, global_graph, scope)
+        )
+        return json.dumps({"restored": count})
 
     # ------------------------------------------------------------------
     # Tool 5: delete_observations
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE_TOOL)
     def delete_observations(
         ctx: Context,
-        deletions: list[dict[str, Any]],
-        scope: str = "workspace",
-    ) -> str:
+        deletions: Annotated[list[ObservationDeletionInput], Field(min_length=1, max_length=500)],
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Delete specific observations from entities.
 
         Each item needs: entityName (str), observations (list[str] of content to delete).
         """
         graph, _, global_graph = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
-        if normalized_scope == "all":
-            return json.dumps({"error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
-        targets = _scoped_graphs(graph, global_graph, scope)
-        if not targets:
-            return _scope_error(scope)
-        if len(targets) == 1:
-            count = targets[0][1].delete_observations(deletions)
-            return json.dumps({"deleted": count})
-        results = [
-            {"source": source, "deleted": target_graph.delete_observations(deletions)}
-            for source, target_graph in targets
-        ]
-        return json.dumps(results, indent=2)
+        count = sum(
+            target.delete_observations(deletions)
+            for _, target in _scope_graphs(graph, global_graph, scope)
+        )
+        return json.dumps({"deleted": count})
 
     # ------------------------------------------------------------------
     # Tool 6: delete_relations
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE_TOOL)
     def delete_relations(
         ctx: Context,
-        relations: list[dict[str, Any]],
-        scope: str = "workspace",
-    ) -> str:
+        relations: Annotated[list[RelationDeletionInput], Field(min_length=1, max_length=500)],
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Delete relations from the knowledge graph.
 
         Each item needs: from (str), to (str), relationType (str).
         """
         graph, _, global_graph = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
-        if normalized_scope == "all":
-            return json.dumps({"error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
-        targets = _scoped_graphs(graph, global_graph, scope)
-        if not targets:
-            return _scope_error(scope)
-        if len(targets) == 1:
-            count = targets[0][1].delete_relations(relations)
-            return json.dumps({"deleted": count})
-        results = [
-            {"source": source, "deleted": target_graph.delete_relations(relations)}
-            for source, target_graph in targets
-        ]
-        return json.dumps(results, indent=2)
+        count = sum(
+            target.delete_relations(relations)
+            for _, target in _scope_graphs(graph, global_graph, scope)
+        )
+        return json.dumps({"deleted": count})
 
     # ------------------------------------------------------------------
     # Tool 7: read_graph
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL)
     def read_graph(
         ctx: Context,
         tags: list[str] | None = None,
         entity_types: list[str] | None = None,
-        limit: int = 0,
+        limit: Annotated[int, Field(ge=0, le=5000)] = 0,
         include_deleted: bool = False,
         compress: bool = True,
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+        page_size: Annotated[int, Field(ge=0, le=500)] = 0,
+        cursor: Annotated[str, Field(max_length=1024)] = "",
+    ) -> StructuredToolResult:
         """Read the knowledge graph (compressed by default).
 
         Filter by tags, entity_types. Set compress=false for full JSON.
         """
-        graph_mgr, cfg, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
-        if len(targets) > 1:
-            results = []
-            for source, target_graph in targets:
-                kg = target_graph.read_graph(
-                    tags=tags,
-                    entity_types=entity_types,
-                    limit=limit,
-                    include_deleted=include_deleted,
+        graph_mgr, cfg, global_graph = _get_ctx(ctx)
+        scoped = _scope_graphs(graph_mgr, global_graph, scope)
+        kg = _merge_scoped_graphs(
+            [
+                (
+                    scope_name,
+                    target.read_graph(
+                        tags=tags,
+                        entity_types=entity_types,
+                        limit=0 if page_size else limit,
+                        include_deleted=include_deleted,
+                    ),
                 )
-                payload: Any
-                if compress:
-                    pinned_ids = _get_pinned_ids(target_graph)
-                    payload = compress_graph(kg, cfg.compression_level, cfg.token_budget, pinned_ids)
-                else:
-                    payload = kg.to_dict()
-                results.append(_source_wrapped(source, payload))
-            return json.dumps(results, indent=2)
-        graph_mgr = targets[0][1]
-        kg = graph_mgr.read_graph(
-            tags=tags,
-            entity_types=entity_types,
-            limit=limit,
-            include_deleted=include_deleted,
+                for scope_name, target in scoped
+            ]
         )
+        if limit > 0 and not page_size:
+            kg.entities = kg.entities[:limit]
+        next_cursor = ""
+        if page_size:
+            fingerprint = _fingerprint_cursor(
+                "read_graph",
+                {
+                    "tags": tags,
+                    "entity_types": entity_types,
+                    "include_deleted": include_deleted,
+                    "scope": scope,
+                    "page_size": page_size,
+                },
+            )
+            kg, next_cursor = _paginate_graph(
+                kg, page_size=page_size, cursor=cursor, fingerprint=fingerprint
+            )
         if compress:
-            pinned_ids = _get_pinned_ids(graph_mgr)
-            return compress_graph(kg, cfg.compression_level, cfg.token_budget, pinned_ids)
-        return json.dumps(kg.to_dict(), indent=2)
+            pinned_ids = set().union(*(_get_pinned_ids(target) for _, target in scoped))
+            rendered: Any = compress_graph(
+                kg, cfg.compression_level, cfg.token_budget, pinned_ids
+            )
+        else:
+            rendered = kg.to_dict()
+        if page_size:
+            return json.dumps({"result": rendered, "nextCursor": next_cursor}, indent=2)
+        return rendered if isinstance(rendered, str) else json.dumps(rendered, indent=2)
 
     # ------------------------------------------------------------------
     # Tool 8: search_nodes
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL)
     def search_nodes(
         ctx: Context,
-        query: str,
+        query: NonEmptyText,
         tags: list[str] | None = None,
         entity_types: list[str] | None = None,
         time_range: list[str] | None = None,
-        limit: int = 20,
+        limit: Annotated[int, Field(ge=1, le=500)] = 20,
         compress: bool = True,
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+        page_size: Annotated[int, Field(ge=0, le=500)] = 0,
+        cursor: Annotated[str, Field(max_length=1024)] = "",
+    ) -> StructuredToolResult:
         """Full-text search with BM25 ranking.
 
         Supports prefix search, phrases ("exact match"), boolean (AND/OR/NOT).
         Filter by tags, entity_types, time_range ([start, end] ISO strings).
         """
-        graph_mgr, cfg, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
+        graph_mgr, cfg, global_graph = _get_ctx(ctx)
         tr = tuple(time_range) if time_range and len(time_range) == 2 else None
-        if len(targets) > 1:
-            results = []
-            for source, target_graph in targets:
-                kg = target_graph.search_fts(
-                    query,
-                    tags=tags,
-                    entity_types=entity_types,
-                    time_range=tr,
-                    limit=limit,
+        searched: list[tuple[str, KnowledgeGraph]] = []
+        diagnostics: list[str] = []
+        for scope_name, target in _scope_graphs(graph_mgr, global_graph, scope):
+            searched.append(
+                (
+                    scope_name,
+                    target.search_fts(
+                        query,
+                        tags=tags,
+                        entity_types=entity_types,
+                        time_range=tr,
+                        limit=0 if page_size else limit,
+                    ),
                 )
-                payload = (
-                    compress_graph(kg, cfg.compression_level, cfg.token_budget)
-                    if compress
-                    else kg.to_dict()
-                )
-                results.append(_source_wrapped(source, payload))
-            return json.dumps(results, indent=2)
-        graph_mgr = targets[0][1]
-        kg = graph_mgr.search_fts(
-            query,
-            tags=tags,
-            entity_types=entity_types,
-            time_range=tr,
-            limit=limit,
-        )
+            )
+            diagnostics.extend(
+                f"{scope_name}:{diagnostic}"
+                for diagnostic in getattr(target, "last_search_diagnostics", [])
+            )
+        kg = _merge_scoped_graphs(searched)
+        kg.entities = kg.entities[:limit] if not page_size else kg.entities
+        next_cursor = ""
+        if page_size:
+            fingerprint = _fingerprint_cursor(
+                "search_nodes",
+                {
+                    "query": query,
+                    "tags": tags,
+                    "entity_types": entity_types,
+                    "time_range": time_range,
+                    "scope": scope,
+                    "page_size": page_size,
+                },
+            )
+            kg, next_cursor = _paginate_graph(
+                kg, page_size=page_size, cursor=cursor, fingerprint=fingerprint
+            )
         if compress:
-            return compress_graph(kg, cfg.compression_level, cfg.token_budget)
-        return json.dumps(kg.to_dict(), indent=2)
+            rendered = compress_graph(kg, cfg.compression_level, cfg.token_budget)
+        else:
+            rendered = kg.to_dict()
+        if page_size:
+            return json.dumps(
+                {
+                    "result": rendered,
+                    "nextCursor": next_cursor,
+                    "diagnostics": diagnostics,
+                },
+                indent=2,
+            )
+        if diagnostics:
+            return json.dumps({"result": rendered, "diagnostics": diagnostics}, indent=2)
+        return rendered if isinstance(rendered, str) else json.dumps(rendered, indent=2)
 
     # ------------------------------------------------------------------
     # Tool 9: open_nodes
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL)
     def open_nodes(
         ctx: Context,
-        names: list[str],
-        depth: int = 0,
-        scope: str = "workspace",
-    ) -> str:
+        names: Annotated[list[Name], Field(min_length=1, max_length=500)],
+        depth: Annotated[int, Field(ge=0, le=10)] = 0,
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Open specific entities by name.
 
         depth=0: exact entities only.
         depth=1: include direct neighbors via relations.
         depth=2+: BFS expansion.
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
-        if len(targets) == 1:
-            kg = targets[0][1].open_nodes(names, depth=depth)
-            return json.dumps(kg.to_dict(), indent=2)
-        results = [
-            _source_wrapped(source, target_graph.open_nodes(names, depth=depth).to_dict())
-            for source, target_graph in targets
-        ]
-        return json.dumps(results, indent=2)
+        graph_mgr, cfg, global_graph = _get_ctx(ctx)
+        kg = _merge_scoped_graphs(
+            [
+                (scope_name, target.open_nodes(names, depth=depth))
+                for scope_name, target in _scope_graphs(graph_mgr, global_graph, scope)
+            ]
+        )
+        return json.dumps(kg.to_dict(), indent=2)
 
     # ------------------------------------------------------------------
     # Tool 10: memory_context (THE KEY TOOL)
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL)
     def memory_context(
         ctx: Context,
         hint: str = "",
         project: str = "",
-        limit: int = 10,
-        scope: str = "all",
-    ) -> str:
+        limit: Annotated[int, Field(ge=1, le=100)] = 10,
+        scope: Scope = "all",
+        budget: Annotated[int, Field(ge=100, le=100_000)] = 500,
+    ) -> StructuredToolResult:
         """Lightweight context snapshot (~200-500 tokens) for scoped durable recall.
 
         Returns: pinned entities, recent activity, hint-matched entities, and graph stats.
@@ -760,34 +1017,29 @@ def create_server(
         Pass limit to control how many hint matches are included; prefer 3-5 unless deeper recall is justified.
         """
         graph_mgr, cfg, global_graph_mgr = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
-        if normalized_scope == "workspace":
-            res = graph_mgr.memory_context(hint=hint, project=project, limit=limit)
-            for item in res.get("pinned", []):
-                item.setdefault("source", "workspace")
-            for item in res.get("hint_matches", []):
-                item.setdefault("source", "workspace")
-            return _format_memory_context_result(res)
-        if normalized_scope == "global":
-            if global_graph_mgr is None:
-                return _scope_error(scope)
-            res = global_graph_mgr.memory_context(hint=hint, project="", limit=limit)
-            for item in res.get("pinned", []):
-                item.setdefault("source", "global")
-            for item in res.get("hint_matches", []):
-                item.setdefault("source", "global")
-            return _format_memory_context_result(res)
-        workspace_result = graph_mgr.memory_context(hint=hint, project=project, limit=limit)
-        global_result = None
-        if global_graph_mgr is not None:
-            global_result = global_graph_mgr.memory_context(hint=hint, project="", limit=limit)
-        result = merge_memory_context_results(workspace_result, global_result, limit=limit)
-        return _format_memory_context_result(result)
+        targets = dict(_scope_graphs(graph_mgr, global_graph_mgr, scope))
+        workspace_result = (
+            targets["workspace"].memory_context(hint=hint, project=project, limit=limit)
+            if "workspace" in targets
+            else None
+        )
+        global_result = (
+            targets["global"].memory_context(hint=hint, project="", limit=limit)
+            if "global" in targets
+            else None
+        )
+        if workspace_result is not None:
+            result = merge_memory_context_results(workspace_result, global_result, limit=limit)
+        elif global_result is not None:
+            result = global_result
+        else:  # pragma: no cover - _scope_graphs always returns or raises
+            raise ValueError("no memory scope is available")
+        return _enforce_budget(_format_memory_context_result(result), budget)
 
     # ------------------------------------------------------------------
     # Tool 11: log_activity
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=WRITE_TOOL)
     def log_activity(
         ctx: Context,
         action: str,
@@ -795,46 +1047,15 @@ def create_server(
         entity_names: list[str] | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
-        scope: str = "workspace",
-    ) -> str:
+    ) -> StructuredToolResult:
         """Record what happened this turn. Auto-creates missing entities.
 
         Common actions: file_changed, decision_made, bug_fixed, feature_added,
         refactored, investigated, discussed, preference_set.
         """
         graph_mgr, cfg, global_graph_mgr = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
-        if normalized_scope == "global":
-            if global_graph_mgr is None:
-                return _scope_error(scope)
-            target_graph = global_graph_mgr
-        elif normalized_scope == "all":
-            results = []
-            for source, target_graph in _scoped_graphs(graph_mgr, global_graph_mgr, scope):
-                entry = target_graph.log_activity(
-                    action=action,
-                    summary=summary,
-                    entity_names=entity_names,
-                    tags=tags,
-                    metadata=metadata,
-                )
-                results.append(
-                    {
-                        "source": source,
-                        "id": entry.id,
-                        "action": entry.action,
-                        "summary": entry.summary,
-                    }
-                )
-            return json.dumps(results, indent=2)
-        else:
-            target_graph = graph_mgr
-        if (
-            normalized_scope == "workspace"
-            and cfg.global_preference_routing_enabled
-            and global_graph_mgr is not None
-            and action == "preference_set"
-        ):
+        target_graph = graph_mgr
+        if cfg.global_preference_routing_enabled and global_graph_mgr is not None and action == "preference_set":
             target_graph = global_graph_mgr
         entry = target_graph.log_activity(
             action=action,
@@ -848,7 +1069,7 @@ def create_server(
     # ------------------------------------------------------------------
     # Tool 12: query_timeline
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL)
     def query_timeline(
         ctx: Context,
         time_range: str | None = None,
@@ -857,22 +1078,20 @@ def create_server(
         actions: list[str] | None = None,
         entity_name: str | None = None,
         session_id: str | None = None,
-        limit: int = 50,
-        scope: str = "workspace",
-    ) -> str:
+        limit: Annotated[int, Field(ge=1, le=1000)] = 50,
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Query activity timeline.
 
         time_range: relative like "2h", "7d", "30m".
         Or use start/end with ISO datetime strings.
         Filter by actions, entity_name, session_id.
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
-
-        def timeline_payload(target_graph: KnowledgeGraphManager) -> list[dict[str, Any]]:
-            entries = target_graph.query_timeline(
+        graph_mgr, _, global_graph = _get_ctx(ctx)
+        entries = [
+            entry
+            for _, target in _scope_graphs(graph_mgr, global_graph, scope)
+            for entry in target.query_timeline(
                 time_range=time_range,
                 start=start,
                 end=end,
@@ -881,30 +1100,29 @@ def create_server(
                 session_id=session_id,
                 limit=limit,
             )
-            return [{"action": e.action, "summary": e.summary, "at": e.created_at} for e in entries]
-
-        if len(targets) == 1:
-            return json.dumps(timeline_payload(targets[0][1]), indent=2)
+        ]
+        entries.sort(key=lambda entry: entry.created_at, reverse=True)
+        entries = entries[:limit]
         return json.dumps(
-            [_source_wrapped(source, timeline_payload(target_graph)) for source, target_graph in targets],
+            [{"action": e.action, "summary": e.summary, "at": e.created_at} for e in entries],
             indent=2,
         )
 
     # ------------------------------------------------------------------
     # Tool 13: manage_tags
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE_TOOL)
     def manage_tags(
         ctx: Context,
         action: str = "list",
         name: str = "",
         description: str = "",
         color: str = "",
-        auto_expire_hours: int | None = None,
+        auto_expire_hours: Annotated[int | None, Field(ge=1, le=87_600)] = None,
         entity_name: str = "",
         tag_name: str = "",
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Manage tags. Actions: list, create, delete, tag, untag, cleanup.
 
         list: show all tags.
@@ -914,18 +1132,18 @@ def create_server(
         untag: remove tag_name from entity_name.
         cleanup: remove expired ephemeral items.
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
-        if normalized_scope == "all" and action in {"delete", "untag"}:
-            return json.dumps({"error": f"scope='all' is not supported for destructive tag action '{action}' to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
+        graph_mgr, _, global_graph = _get_ctx(ctx)
+        targets = _scope_graphs(graph_mgr, global_graph, scope)
+        if action in {"tag", "untag"} and scope == "all" and entity_name:
+            owner = _entity_owner(graph_mgr, global_graph, entity_name)
+            if owner is None:
+                raise ValueError(f"Entity not found: {entity_name}")
+            targets = [owner]
 
-        def run_manage_tags(target_graph: KnowledgeGraphManager) -> Any:
-            if action == "list":
-                tags = target_graph.list_tags()
-                return [
+        if action == "list":
+            tags = [tag for _, target in targets for tag in target.list_tags()]
+            return json.dumps(
+                [
                     {
                         "name": t.name,
                         "description": t.description,
@@ -933,260 +1151,260 @@ def create_server(
                         "auto_expire_hours": t.auto_expire_hours,
                     }
                     for t in tags
-                ]
+                ],
+                indent=2,
+            )
 
-            if action == "create":
-                if not name:
-                    return {"error": "name required"}
-                tag = target_graph.create_tag(name, description, color, auto_expire_hours)
-                return {"created": tag.name}
+        elif action == "create":
+            if not name:
+                raise ValueError("name required")
+            tag = targets[0][1].create_tag(name, description, color, auto_expire_hours)
+            return json.dumps({"created": tag.name})
 
-            if action == "delete":
-                if not name:
-                    return {"error": "name required"}
-                try:
-                    ok = target_graph.delete_tag(name)
-                    return {"deleted": ok}
-                except ValueError as e:
-                    return {"error": str(e)}
+        elif action == "delete":
+            if not name:
+                raise ValueError("name required")
+            try:
+                ok = targets[0][1].delete_tag(name)
+                return json.dumps({"deleted": ok})
+            except ValueError as e:
+                raise ValueError(str(e)) from e
 
-            if action == "tag":
-                if not entity_name or not tag_name:
-                    return {"error": "entity_name and tag_name required"}
-                ok = target_graph.tag_entity(entity_name, tag_name)
-                return {"tagged": ok}
+        elif action == "tag":
+            if not entity_name or not tag_name:
+                raise ValueError("entity_name and tag_name required")
+            ok = targets[0][1].tag_entity(entity_name, tag_name)
+            return json.dumps({"tagged": ok})
 
-            if action == "untag":
-                if not entity_name or not tag_name:
-                    return {"error": "entity_name and tag_name required"}
-                ok = target_graph.untag_entity(entity_name, tag_name)
-                return {"untagged": ok}
+        elif action == "untag":
+            if not entity_name or not tag_name:
+                raise ValueError("entity_name and tag_name required")
+            ok = targets[0][1].untag_entity(entity_name, tag_name)
+            return json.dumps({"untagged": ok})
 
-            if action == "cleanup":
-                cleaned = target_graph.db.cleanup_expired()
-                return {"cleaned": cleaned}
+        elif action == "cleanup":
+            cleaned = sum(target.db.cleanup_expired() for _, target in targets)
+            return json.dumps({"cleaned": cleaned})
 
-            return {"error": f"Unknown action: {action}"}
-
-        if len(targets) == 1:
-            return json.dumps(run_manage_tags(targets[0][1]), indent=2)
-        return json.dumps(
-            [_source_wrapped(source, run_manage_tags(target_graph)) for source, target_graph in targets],
-            indent=2,
-        )
+        raise ValueError(f"Unknown action: {action}")
 
     # ------------------------------------------------------------------
     # Tool 14: merge_entities
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE_TOOL)
     def merge_entities(
         ctx: Context,
         source: str,
         target: str,
         strategy: str = "combine",
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Merge source entity into target. Source is soft-deleted.
 
         strategy: 'combine' (move all observations) or 'dedupe' (skip duplicates).
         Relations and tags are transferred. Self-relations are removed.
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
-        if normalized_scope == "all":
-            return json.dumps({"error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
-
-        def merge_payload(target_graph: KnowledgeGraphManager) -> Any:
-            result = target_graph.merge_entities(source, target, strategy)
-            if result:
-                return result.to_dict()
-            return {"error": "Source or target entity not found"}
-
-        if len(targets) == 1:
-            return json.dumps(merge_payload(targets[0][1]), indent=2)
-        return json.dumps(
-            [_source_wrapped(source_name, merge_payload(target_graph)) for source_name, target_graph in targets],
-            indent=2,
-        )
+        graph_mgr, _, global_graph = _get_ctx(ctx)
+        targets = _scope_graphs(graph_mgr, global_graph, scope)
+        if scope == "all":
+            source_owner = _entity_owner(graph_mgr, global_graph, source)
+            target_owner = _entity_owner(graph_mgr, global_graph, target)
+            if source_owner is None or target_owner is None or source_owner[0] != target_owner[0]:
+                raise ValueError("merge entities must exist in the same scope")
+            targets = [source_owner]
+        result = targets[0][1].merge_entities(source, target, strategy)
+        if result:
+            return json.dumps(result.to_dict(), indent=2)
+        raise ValueError("Source or target entity not found")
 
     # ------------------------------------------------------------------
     # Tool 15: export_graph / import_graph
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL)
     def export_graph(
         ctx: Context,
         format: str = "json",
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Export the full knowledge graph.
 
         format: 'json' or 'jsonl' (compatible with old @modelcontextprotocol/server-memory).
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
+        graph_mgr, _, global_graph = _get_ctx(ctx)
+        targets = _scope_graphs(graph_mgr, global_graph, scope)
+        if format == "snapshot":
+            return json.dumps(
+                {
+                    "format": "server-memory-multiscope-snapshot",
+                    "version": 1,
+                    "scopes": {
+                        scope_name: target.db.export_snapshot()
+                        for scope_name, target in targets
+                    },
+                },
+                separators=(",", ":"),
+            )
         if len(targets) == 1:
             return targets[0][1].export_graph(fmt=format)
-        if format == "jsonl":
-            lines = []
-            for source, target_graph in targets:
-                for line in target_graph.export_graph(fmt="jsonl").splitlines():
-                    if line.strip():
-                        item = json.loads(line)
-                        item["source"] = source
-                        lines.append(json.dumps(item))
-            return "\n".join(lines)
         return json.dumps(
-            [
-                _source_wrapped(source, json.loads(target_graph.export_graph(fmt="json")))
-                for source, target_graph in targets
-            ],
+            {
+                scope_name: json.loads(target.export_graph(fmt="json"))
+                for scope_name, target in targets
+            },
             indent=2,
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE_TOOL)
     def import_graph(
         ctx: Context,
         data: str,
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Import knowledge graph data. Auto-detects JSON or JSONL format.
 
         Compatible with old @modelcontextprotocol/server-memory JSONL files.
         Skips duplicate entities. Skips relations to missing entities.
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
-        if len(targets) == 1:
-            counts = targets[0][1].import_graph(data)
-            return json.dumps(counts)
-        return json.dumps(
-            [_source_wrapped(source, target_graph.import_graph(data)) for source, target_graph in targets],
-            indent=2,
-        )
+        if len(data.encode("utf-8")) > 50 * 1024 * 1024:
+            raise ValueError("import payload exceeds 50 MiB limit")
+        graph_mgr, _, global_graph = _get_ctx(ctx)
+        parsed: Any = None
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            pass
+        if isinstance(parsed, dict) and parsed.get("format") == "server-memory-multiscope-snapshot":
+            if parsed.get("version") != 1 or not isinstance(parsed.get("scopes"), dict):
+                raise ValueError("unsupported multi-scope snapshot")
+            targets = dict(_scope_graphs(graph_mgr, global_graph, scope))
+            requested = parsed["scopes"]
+            if not set(requested).issubset(targets):
+                raise ValueError("snapshot contains an unavailable or unrequested scope")
+            # Validate every payload against disposable in-memory stores before
+            # changing either persistent scope.
+            for snapshot in requested.values():
+                validator = Database(":memory:")
+                validator.open()
+                try:
+                    validator.import_snapshot(snapshot)
+                finally:
+                    validator.close()
+            prior = {
+                scope_name: targets[scope_name].db.export_snapshot()
+                for scope_name in requested
+            }
+            applied: list[str] = []
+            try:
+                for scope_name, snapshot in requested.items():
+                    targets[scope_name].db.import_snapshot(snapshot)
+                    applied.append(scope_name)
+            except Exception:
+                for scope_name in reversed(applied):
+                    targets[scope_name].db.import_snapshot(
+                        prior[scope_name], conflict="replace"
+                    )
+                raise
+            return json.dumps({"imported_scopes": sorted(requested)})
+        if scope == "all":
+            raise ValueError(
+                "legacy JSON/JSONL import requires scope='workspace' or scope='global'"
+            )
+        target = _scope_graphs(graph_mgr, global_graph, scope)[0][1]
+        counts = target.import_graph(data)
+        return json.dumps(counts)
 
     # ------------------------------------------------------------------
     # Tool 16: memory_stats
     # ------------------------------------------------------------------
-    @mcp.tool()
-    def memory_stats(ctx: Context, scope: str = "workspace") -> str:
+    @mcp.tool(annotations=READ_ONLY_TOOL)
+    def memory_stats(ctx: Context, scope: Scope = "workspace") -> StructuredToolResult:
         """Get memory statistics: entity/relation/observation counts,
         tag distribution, DB size, orphan entities, deleted items.
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
-        if len(targets) == 1:
-            return json.dumps(targets[0][1].memory_stats(), indent=2)
-        return json.dumps(
-            [_source_wrapped(source, target_graph.memory_stats()) for source, target_graph in targets],
-            indent=2,
-        )
+        graph_mgr, _, global_graph = _get_ctx(ctx)
+        scoped_stats = {
+            scope_name: target.memory_stats()
+            for scope_name, target in _scope_graphs(graph_mgr, global_graph, scope)
+        }
+        if len(scoped_stats) == 1:
+            stats = next(iter(scoped_stats.values()))
+        else:
+            stats = {"scopes": scoped_stats}
+        return json.dumps(stats, indent=2)
 
     # ------------------------------------------------------------------
     # Tool 17: backup_memory
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=WRITE_TOOL)
     def backup_memory(
         ctx: Context,
         dest_path: str = "",
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Create a backup of the memory database.
 
         Default destination: ~/.local/share/server-memory/backups/memory-YYYYMMDD-HHMMSS.db
         Provide dest_path to override the backup location.
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
-
-        normalized_scope = _normalize_scope(scope)
-
-        def backup_one(source: str, target_graph: KnowledgeGraphManager) -> dict[str, str]:
-            db = target_graph.db
-            if dest_path:
-                requested_path = Path(dest_path)
-                if len(targets) > 1:
-                    if requested_path.suffix:
-                        backup_path = (
-                            requested_path.parent
-                            / f"{requested_path.stem}-{source}{requested_path.suffix}"
-                        )
-                    else:
-                        backup_path = requested_path / f"{source}.db"
-                else:
-                    backup_path = requested_path
-            else:
-                backup_dir = Path(db.db_path).parent / "backups"
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                backup_path = backup_dir / f"memory-{source}-{ts}.db"
-
+        graph_mgr, _, global_graph = _get_ctx(ctx)
+        targets = _scope_graphs(graph_mgr, global_graph, scope)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        paths: dict[str, str] = {}
+        for scope_name, target in targets:
+            backup_path = _resolve_backup_path(
+                target.db.db_path,
+                dest_path,
+                scope_name=scope_name,
+                multiple_scopes=len(targets) > 1,
+                timestamp=ts,
+            )
             backup_path.parent.mkdir(parents=True, exist_ok=True)
-            db.backup(str(backup_path))
-            result = {"backup_path": str(backup_path), "status": "ok"}
-            if normalized_scope != "workspace":
-                result["source"] = source
-            return result
-
-        results = [backup_one(source, target_graph) for source, target_graph in targets]
-        if len(results) == 1:
-            return json.dumps(results[0])
-        return json.dumps(results, indent=2)
+            target.db.backup(str(backup_path))
+            paths[scope_name] = str(backup_path)
+        result: dict[str, Any] = {"backup_paths": paths, "status": "ok"}
+        if len(paths) == 1:
+            result["backup_path"] = next(iter(paths.values()))
+        return json.dumps(result)
 
     # ------------------------------------------------------------------
     # Tool 18: get_observation_history
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL)
     def get_observation_history(
         ctx: Context,
         entity_name: str,
         content_prefix: str = "",
-        scope: str = "workspace",
-    ) -> str:
+        scope: Scope = "workspace",
+    ) -> StructuredToolResult:
         """Get observation version history for an entity.
 
         Shows current content, version number, importance, obs_type,
         and all previous versions with timestamps.
         Use content_prefix to filter to specific observations.
         """
-        graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
-        targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
-        if not targets:
-            return _scope_error(scope)
-
-        def history_payload(target_graph: KnowledgeGraphManager) -> Any:
-            history = target_graph.get_observation_history(entity_name, content_prefix)
-            if not history:
-                return {"error": f"No observations found for '{entity_name}'"}
-            return history
-
-        if len(targets) == 1:
-            return json.dumps(history_payload(targets[0][1]), indent=2)
-        return json.dumps(
-            [_source_wrapped(source, history_payload(target_graph)) for source, target_graph in targets],
-            indent=2,
-        )
+        graph_mgr, _, global_graph = _get_ctx(ctx)
+        histories = [
+            {
+                "scope": scope_name,
+                "history": target.get_observation_history(entity_name, content_prefix),
+            }
+            for scope_name, target in _scope_graphs(graph_mgr, global_graph, scope)
+        ]
+        history = histories[0]["history"] if len(histories) == 1 else histories
+        if not history:
+            raise ValueError(f"No observations found for '{entity_name}'")
+        return json.dumps(history, indent=2)
 
     # ------------------------------------------------------------------
     # Tool 19: memory_context_full
     # ------------------------------------------------------------------
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL)
     def memory_context_full(
         ctx: Context,
         project: str = "",
-        budget: int = 1000,
-        scope: str = "all",
-    ) -> str:
+        budget: Annotated[int, Field(ge=100, le=100_000)] = 1000,
+        scope: Scope = "all",
+    ) -> StructuredToolResult:
         """Rich context snapshot for rare deep bootstrap (~500-1500 tokens).
 
         Returns all pinned entities with full observations, recent activity (last 10),
@@ -1194,65 +1412,45 @@ def create_server(
         for a cross-session task. Prefer memory_context for ordinary scoped recall.
         """
         graph_mgr, cfg, global_graph_mgr = _get_ctx(ctx)
-        normalized_scope = _normalize_scope(scope)
         active_project = project or cfg.project
 
-        # Read pinned entities with full data
-        pinned_tags = ["pinned"]
-        if active_project:
-            pinned_tags.append(active_project)
-        if normalized_scope == "global":
-            if global_graph_mgr is None:
-                return _scope_error(scope)
-            graph_mgr = global_graph_mgr
-            global_graph_mgr = None
-            active_project = ""
-        kg = graph_mgr.read_graph(tags=["pinned"], limit=20)
+        targets = _scope_graphs(graph_mgr, global_graph_mgr, scope)
+        scoped_graphs: list[tuple[str, KnowledgeGraph]] = []
+        for scope_name, target in targets:
+            target_kg = target.read_graph(tags=["pinned"], limit=20)
+            if scope_name == "workspace" and active_project:
+                project_kg = target.read_graph(tags=[active_project], limit=20)
+                known_ids = {entity.id for entity in target_kg.entities}
+                target_kg.entities.extend(
+                    entity for entity in project_kg.entities if entity.id not in known_ids
+                )
+                target_kg.relations.extend(project_kg.relations)
+            elif scope_name == "global":
+                preference_kg = target.read_graph(tags=[PREFERENCE_TAG], limit=20)
+                known_ids = {entity.id for entity in target_kg.entities}
+                target_kg.entities.extend(
+                    entity for entity in preference_kg.entities if entity.id not in known_ids
+                )
+                target_kg.relations.extend(preference_kg.relations)
+            scoped_graphs.append((scope_name, target_kg))
+        kg = _merge_scoped_graphs(scoped_graphs)
 
-        # If project scoped, also get project-tagged entities
-        if active_project:
-            project_kg = graph_mgr.read_graph(tags=[active_project], limit=20)
-            # Merge, avoiding duplicates
-            existing_ids = {e.id for e in kg.entities}
-            for e in project_kg.entities:
-                if e.id not in existing_ids:
-                    kg.entities.append(e)
-                    existing_ids.add(e.id)
-            for r in project_kg.relations:
-                kg.relations.append(r)
-
-        if normalized_scope == "all" and global_graph_mgr is not None:
-            for entity in kg.entities:
-                if "workspace" not in entity.tags:
-                    entity.tags = list(entity.tags) + ["workspace"]
-
-            global_kg = global_graph_mgr.read_graph(tags=["pinned", PREFERENCE_TAG], limit=20)
-            existing_global_names = set()
-            id_offset = 100_000_000
-            for entity in global_kg.entities:
-                if entity.name.lower() not in existing_global_names:
-                    entity.id += id_offset
-                    if "global" not in entity.tags:
-                        entity.tags = list(entity.tags) + ["global"]
-                    kg.entities.append(entity)
-                    existing_global_names.add(entity.name.lower())
-            kg.relations.extend(global_kg.relations)
-
-        pinned_ids = _get_pinned_ids(graph_mgr)
-        if normalized_scope == "all" and global_graph_mgr is not None:
-            global_pinned = {pid + 100_000_000 for pid in _get_pinned_ids(global_graph_mgr)}
-            pinned_ids |= global_pinned
+        pinned_ids = set().union(*(_get_pinned_ids(target) for _, target in targets))
         output = compress_graph(kg, cfg.compression_level, budget, pinned_ids)
 
         # Append recent activity
-        recent = graph_mgr.query_timeline(time_range="24h", limit=10)
-        if normalized_scope == "all" and global_graph_mgr is not None:
-            recent.extend(global_graph_mgr.query_timeline(time_range="24h", limit=5))
+        recent = [
+            entry
+            for _, target in targets
+            for entry in target.query_timeline(time_range="24h", limit=10)
+        ]
+        recent.sort(key=lambda entry: entry.created_at, reverse=True)
+        recent = recent[:10]
         if recent:
             acts = [f"{e.action}:{e.summary}" for e in recent]
             output += "\n---\nRecent(24h): " + " | ".join(acts)
 
-        return output
+        return _enforce_budget(output, budget)
 
     return mcp
 
