@@ -24,6 +24,8 @@ from .models import (
     Tag,
 )
 
+_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+
 logger = logging.getLogger(__name__)
 
 _embedding_backfill_lock = threading.Lock()
@@ -1756,11 +1758,11 @@ class KnowledgeGraphManager:
 
     @staticmethod
     def _normalize_memory_text(text: str) -> str:
-        return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+        return " ".join(_WORD_PATTERN.findall(text.lower()))
 
     @staticmethod
     def _tokenize_memory_text(text: str) -> set[str]:
-        return set(re.findall(r"[a-z0-9]+", text.lower()))
+        return set(_WORD_PATTERN.findall(text.lower()))
 
     def _should_scope_memory_context_hint(self, hint: str, query_tokens: set[str]) -> bool:
         if not hint.strip():
@@ -2298,21 +2300,34 @@ class KnowledgeGraphManager:
             live_ids,
         ).fetchall()
         obs_by_entity: dict[int, list[Observation]] = {}
-        for r in obs_rows:
-            obs_by_entity.setdefault(r["entity_id"], []).append(
-                Observation(
-                    id=r["id"],
-                    entity_id=r["entity_id"],
-                    content=r["content"],
-                    source=r["source"],
-                    confidence=r["confidence"],
-                    importance=r["importance"] if "importance" in r.keys() else 0.5,
-                    obs_type=r["obs_type"] if "obs_type" in r.keys() else "",
-                    version=r["version"],
-                    created_at=r["created_at"],
-                    updated_at=r["updated_at"],
+        if obs_rows:
+            try:
+                obs_rows[0]["importance"]
+                has_importance = True
+            except IndexError:
+                has_importance = False
+
+            try:
+                obs_rows[0]["obs_type"]
+                has_obs_type = True
+            except IndexError:
+                has_obs_type = False
+
+            for r in obs_rows:
+                obs_by_entity.setdefault(r["entity_id"], []).append(
+                    Observation(
+                        id=r["id"],
+                        entity_id=r["entity_id"],
+                        content=r["content"],
+                        source=r["source"],
+                        confidence=r["confidence"],
+                        importance=r["importance"] if has_importance else 0.5,
+                        obs_type=r["obs_type"] if has_obs_type else "",
+                        version=r["version"],
+                        created_at=r["created_at"],
+                        updated_at=r["updated_at"],
+                    )
                 )
-            )
 
         # Batch fetch tags
         tag_rows = cx.execute(
