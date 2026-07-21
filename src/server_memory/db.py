@@ -222,9 +222,13 @@ CREATE TABLE IF NOT EXISTS observation_embeddings (
 class Database:
     """Manages SQLite connection with WAL mode, FK enforcement, and FTS5."""
 
-    CONNECT_TIMEOUT_SECONDS = 1.5
-    BUSY_TIMEOUT_MS = 100
-    WRITE_TIMEOUT_SECONDS = 1.5
+    # Backward-compatible defaults aligned with public main. Operators may still
+    # choose fail-fast interactive writes via MEMORY_WRITE_TIMEOUT_MS.
+    CONNECT_TIMEOUT_SECONDS = 30.0
+    BUSY_TIMEOUT_MS = 30_000
+    WRITE_TIMEOUT_SECONDS = 30.0
+    # Schema upgrades (especially v6 embedding buckets) may rewrite large tables.
+    MIGRATION_BUSY_TIMEOUT_MS = 120_000
     LOCK_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8)
 
     def __init__(
@@ -238,6 +242,7 @@ class Database:
             raise ValueError("write_timeout_seconds must be positive")
         self.write_timeout_seconds = write_timeout_seconds
         self.conn: sqlite3.Connection | None = None
+        self._busy_timeout_ms = self.BUSY_TIMEOUT_MS
 
     def open(self) -> None:
         try:
@@ -257,11 +262,16 @@ class Database:
             self.conn.close()
             self.conn = None
 
+    def _set_busy_timeout(self, busy_timeout_ms: int) -> None:
+        assert self.conn is not None
+        self._busy_timeout_ms = busy_timeout_ms
+        self.conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+
     def _configure(self) -> None:
         assert self.conn is not None
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute(f"PRAGMA busy_timeout={self.BUSY_TIMEOUT_MS}")
+        self._set_busy_timeout(self.BUSY_TIMEOUT_MS)
         self.conn.execute("PRAGMA synchronous=NORMAL")
 
     def _init_schema(self) -> None:
@@ -292,46 +302,60 @@ class Database:
             # Table doesn't exist yet — proceed with full init
             current_version = 0
 
-        # Full init with retry for lock contention
-        for attempt in range(3):
-            try:
-                self.conn.executescript(DDL)
-                # Seed system tags
-                for name, desc, color, is_sys, expire in SYSTEM_TAGS:
+        # Use a migration-appropriate busy timeout while upgrading schema.
+        # Keep migrations in one commit when possible; required-column detection
+        # resumes incomplete upgrades if DDL auto-commit left a partial state.
+        previous_busy_timeout = self._busy_timeout_ms
+        self._set_busy_timeout(self.MIGRATION_BUSY_TIMEOUT_MS)
+        try:
+            # Full init with retry for lock contention
+            for attempt in range(3):
+                try:
+                    self.conn.executescript(DDL)
+                    # Seed system tags
+                    for name, desc, color, is_sys, expire in SYSTEM_TAGS:
+                        self.conn.execute(
+                            "INSERT OR IGNORE INTO tags (name, description, color, "
+                            "is_system, auto_expire_hours) VALUES (?, ?, ?, ?, ?)",
+                            (name, desc, color, int(is_sys), expire),
+                        )
+                    # Run pending migrations
+                    if current_version < 2:
+                        self._migrate_to_v2()
+                    if current_version < 3:
+                        self._migrate_to_v3()
+                    if current_version < 4:
+                        self._migrate_to_v4()
+                    if current_version < 5:
+                        self._migrate_to_v5()
+                    if current_version < 6:
+                        self._migrate_to_v6()
+                    # Record schema version
                     self.conn.execute(
-                        "INSERT OR IGNORE INTO tags (name, description, color, "
-                        "is_system, auto_expire_hours) VALUES (?, ?, ?, ?, ?)",
-                        (name, desc, color, int(is_sys), expire),
+                        "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
+                        (SCHEMA_VERSION,),
                     )
-                # Run pending migrations
-                if current_version < 2:
-                    self._migrate_to_v2()
-                if current_version < 3:
-                    self._migrate_to_v3()
-                if current_version < 4:
-                    self._migrate_to_v4()
-                if current_version < 5:
-                    self._migrate_to_v5()
-                if current_version < 6:
-                    self._migrate_to_v6()
-                # Record schema version
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
-                    (SCHEMA_VERSION,),
-                )
-                self.conn.commit()
-                return
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e) and attempt < 2:
-                    delay = 2**attempt  # 1s, 2s
-                    logger.warning(
-                        "DB locked during init (attempt %d/3), retrying in %ds...",
-                        attempt + 1,
-                        delay,
-                    )
-                    time.sleep(delay)
-                    continue
-                raise
+                    self.conn.commit()
+                    return
+                except sqlite3.OperationalError as e:
+                    if self.conn.in_transaction:
+                        self.conn.rollback()
+                    if "locked" in str(e).lower() and attempt < 2:
+                        delay = 2**attempt  # 1s, 2s
+                        logger.warning(
+                            "DB locked during init (attempt %d/3), retrying in %ds...",
+                            attempt + 1,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    raise
+                except Exception:
+                    if self.conn.in_transaction:
+                        self.conn.rollback()
+                    raise
+        finally:
+            self._set_busy_timeout(previous_busy_timeout)
 
     def _migrate_to_v2(self) -> None:
         """Migrate from schema v1 to v2: add embedding tables."""

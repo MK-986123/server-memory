@@ -59,7 +59,7 @@ class MemoryConfig:
         default_factory=lambda: int(os.environ.get("MEMORY_WRITE_EMBEDDING_BUDGET_MS", "10000"))
     )
     write_timeout_ms: int = field(
-        default_factory=lambda: int(os.environ.get("MEMORY_WRITE_TIMEOUT_MS", "1500"))
+        default_factory=lambda: int(os.environ.get("MEMORY_WRITE_TIMEOUT_MS", "30000"))
     )
     project: str = field(default_factory=lambda: os.environ.get("MEMORY_PROJECT", ""))
     dedup_threshold: float = field(

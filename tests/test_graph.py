@@ -121,10 +121,13 @@ def test_create_entities_skip_duplicates_releases_transaction_lock():
 
 
 def test_create_entities_raises_when_database_is_locked():
+    from server_memory.db import DatabaseBusyError
+
     db_path = Path(tempfile.mkdtemp()) / "memory.db"
 
-    blocked_db = Database(db_path)
+    blocked_db = Database(db_path, write_timeout_seconds=0.3)
     blocked_db.open()
+    blocked_db.cx.execute("PRAGMA busy_timeout=50")
     locker = sqlite3.connect(db_path, check_same_thread=False)
     locker.execute("BEGIN EXCLUSIVE")
     try:
@@ -132,8 +135,9 @@ def test_create_entities_raises_when_database_is_locked():
         try:
             blocked_graph.create_entities([{"name": "Blocked", "entityType": "note"}])
             assert False, "Expected create_entities to surface the lock error"
-        except sqlite3.OperationalError as exc:
-            assert "locked" in str(exc).lower()
+        except DatabaseBusyError as exc:
+            assert "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            assert exc.retryable is True
     finally:
         blocked_db.close()
         locker.rollback()
@@ -143,7 +147,8 @@ def test_create_entities_raises_when_database_is_locked():
 def test_create_entities_retries_until_lock_is_released():
     db_path = Path(tempfile.mkdtemp()) / "memory.db"
 
-    blocked_db = Database(db_path)
+    # Default write timeout is 30s; release well inside that window.
+    blocked_db = Database(db_path, write_timeout_seconds=5.0)
     blocked_db.open()
     blocked_db.cx.execute("PRAGMA busy_timeout=50")
     locker = sqlite3.connect(db_path, check_same_thread=False)
