@@ -800,7 +800,11 @@ def create_server(
         entityNames: Annotated[list[Name], Field(min_length=1, max_length=500)],
         scope: Scope = "workspace",
     ) -> StructuredToolResult:
-        """Restore soft-deleted workspace entities and safe associated relations."""
+        """Restore soft-deleted entities and safe associated relations.
+
+        Scope selects which database(s) to restore from: `workspace`, `global`,
+        or `all` (both, when global memory is enabled).
+        """
         graph, _, global_graph = _get_ctx(ctx)
         count = sum(
             target.restore_entities(entityNames)
@@ -1244,7 +1248,11 @@ def create_server(
     ) -> StructuredToolResult:
         """Export the full knowledge graph.
 
-        format: 'json' or 'jsonl' (compatible with old @modelcontextprotocol/server-memory).
+        format:
+          - 'json' / 'jsonl': graph payload compatible with classic MCP memory JSONL
+          - 'snapshot': lossless multi-scope snapshot
+            (`format=server-memory-multiscope-snapshot`, `version=1`,
+            `scopes` map of per-database snapshot tables)
         """
         graph_mgr, _, global_graph = _get_ctx(ctx)
         targets = _scope_graphs(graph_mgr, global_graph, scope)

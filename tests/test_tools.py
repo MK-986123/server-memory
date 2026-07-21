@@ -55,10 +55,41 @@ def test_mcp_tools_advertise_safety_and_bounded_contracts():
     assert "scope" in by_name["memory_context_full"].inputSchema["properties"]
     assert "cursor" in by_name["read_graph"].inputSchema["properties"]
     assert by_name["open_nodes"].inputSchema["properties"]["depth"]["maximum"] == 10
+    assert "scope" in by_name["restore_entities"].inputSchema["properties"]
     for tool in tools:
         assert tool.outputSchema["type"] == "object"
         assert set(tool.outputSchema["properties"]) == {"text", "data"}
         assert "result" not in tool.outputSchema["properties"]
+
+
+def test_structured_tool_result_preserves_legacy_text_payload():
+    """Text-oriented clients must still receive the prior JSON string payload."""
+    legacy = json.dumps({"deleted": 2, "note": "legacy text clients"})
+    adapted = server_module.StructuredToolResult.model_validate(legacy)
+    assert adapted.text == legacy
+    assert adapted.data == {"deleted": 2, "note": "legacy text clients"}
+
+    plain = "not-json-but-still-text"
+    adapted_plain = server_module.StructuredToolResult.model_validate(plain)
+    assert adapted_plain.text == plain
+    assert adapted_plain.data is None
+
+    # Direct Python tool call path still returns the established string.
+    workspace_db = Database(":memory:")
+    workspace_db.open()
+    try:
+        graph = KnowledgeGraphManager(workspace_db)
+        graph.create_entities([{"name": "Legacy", "entityType": "note"}])
+        config = MemoryConfig(embedding_enabled=False, global_db_enabled=False)
+        ctx = _tool_ctx(graph, config)
+        raw = _tool_fn("delete_entities")(ctx, entityNames=["Legacy"], scope="workspace")
+        assert isinstance(raw, str)
+        assert json.loads(raw) == {"deleted": 1}
+        structured = server_module.StructuredToolResult.model_validate(raw)
+        assert structured.text == raw
+        assert structured.data == {"deleted": 1}
+    finally:
+        workspace_db.close()
 
 
 def test_graph_pagination_cursor_is_stable_and_query_bound(graph):
