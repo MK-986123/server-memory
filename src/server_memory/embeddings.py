@@ -29,9 +29,15 @@ def _submit_bounded(fn, *args):
     """Submit timeout work without allowing abandoned calls to grow threads unboundedly."""
     if not _timeout_slots.acquire(blocking=False):
         return None
-    future = _timeout_executor.submit(fn, *args)
+    try:
+        future = _timeout_executor.submit(fn, *args)
+    except Exception:
+        _timeout_slots.release()
+        raise
     future.add_done_callback(lambda _future: _timeout_slots.release())
     return future
+
+
 class EmbeddingEngine:
     """Lazy-loading embedding engine using sentence-transformers."""
 
