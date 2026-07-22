@@ -51,8 +51,7 @@ def load_auth_tokens(token_path: str | os.PathLike[str] | None = None) -> list[s
 
 def _is_valid_id(value: Any) -> bool:
     return value is None or (
-        isinstance(value, str)
-        or (isinstance(value, (int, float)) and not isinstance(value, bool))
+        isinstance(value, str) or (isinstance(value, (int, float)) and not isinstance(value, bool))
     )
 
 

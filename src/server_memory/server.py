@@ -228,10 +228,12 @@ def merge_memory_context_results(
             limit=limit,
         ),
         "stats": {
-            "entities": int(workspace_stats.get("entities", 0)) + int(global_stats.get("entities", 0)),
+            "entities": int(workspace_stats.get("entities", 0))
+            + int(global_stats.get("entities", 0)),
             "observations": int(workspace_stats.get("observations", 0))
             + int(global_stats.get("observations", 0)),
-            "relations": int(workspace_stats.get("relations", 0)) + int(global_stats.get("relations", 0)),
+            "relations": int(workspace_stats.get("relations", 0))
+            + int(global_stats.get("relations", 0)),
             "workspace_entities": int(workspace_stats.get("entities", 0)),
             "global_entities": int(global_stats.get("entities", 0)),
         },
@@ -277,7 +279,9 @@ def _safe_close_db(database: Database | None, has_active_exc: bool) -> None:
         database.close()
     except Exception as exc:
         if has_active_exc:
-            logger.error("Suppressing database close error because another exception is active: %s", exc)
+            logger.error(
+                "Suppressing database close error because another exception is active: %s", exc
+            )
         else:
             raise
 
@@ -285,6 +289,7 @@ def _safe_close_db(database: Database | None, has_active_exc: bool) -> None:
 def _close_lifespan_databases(db: Database | None, global_db: Database | None) -> None:
     """Close lifespan databases safely, ensuring both are closed and exceptions are handled correctly."""
     import sys
+
     has_active_exc = sys.exc_info()[1] is not None
     try:
         if global_db is not None:
@@ -497,7 +502,9 @@ def create_server(
             if normalized_scope == "all":
                 results = []
                 for source, target_graph in _scoped_graphs(graph, global_graph, scope):
-                    results.append(_source_wrapped(source, target_graph.add_observations(observations)))
+                    results.append(
+                        _source_wrapped(source, target_graph.add_observations(observations))
+                    )
                 return json.dumps(results, indent=2)
 
             workspace_observations = observations
@@ -536,7 +543,11 @@ def create_server(
         graph, _, global_graph = _get_ctx(ctx)
         normalized_scope = _normalize_scope(scope)
         if normalized_scope == "all":
-            return json.dumps({"error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
+            return json.dumps(
+                {
+                    "error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."
+                }
+            )
         targets = _scoped_graphs(graph, global_graph, scope)
         if not targets:
             return _scope_error(scope)
@@ -565,7 +576,11 @@ def create_server(
         graph, _, global_graph = _get_ctx(ctx)
         normalized_scope = _normalize_scope(scope)
         if normalized_scope == "all":
-            return json.dumps({"error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
+            return json.dumps(
+                {
+                    "error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."
+                }
+            )
         targets = _scoped_graphs(graph, global_graph, scope)
         if not targets:
             return _scope_error(scope)
@@ -594,7 +609,11 @@ def create_server(
         graph, _, global_graph = _get_ctx(ctx)
         normalized_scope = _normalize_scope(scope)
         if normalized_scope == "all":
-            return json.dumps({"error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
+            return json.dumps(
+                {
+                    "error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."
+                }
+            )
         targets = _scoped_graphs(graph, global_graph, scope)
         if not targets:
             return _scope_error(scope)
@@ -640,7 +659,9 @@ def create_server(
                 payload: Any
                 if compress:
                     pinned_ids = _get_pinned_ids(target_graph)
-                    payload = compress_graph(kg, cfg.compression_level, cfg.token_budget, pinned_ids)
+                    payload = compress_graph(
+                        kg, cfg.compression_level, cfg.token_budget, pinned_ids
+                    )
                 else:
                     payload = kg.to_dict()
                 results.append(_source_wrapped(source, payload))
@@ -886,7 +907,10 @@ def create_server(
         if len(targets) == 1:
             return json.dumps(timeline_payload(targets[0][1]), indent=2)
         return json.dumps(
-            [_source_wrapped(source, timeline_payload(target_graph)) for source, target_graph in targets],
+            [
+                _source_wrapped(source, timeline_payload(target_graph))
+                for source, target_graph in targets
+            ],
             indent=2,
         )
 
@@ -917,7 +941,11 @@ def create_server(
         graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
         normalized_scope = _normalize_scope(scope)
         if normalized_scope == "all" and action in {"delete", "untag"}:
-            return json.dumps({"error": f"scope='all' is not supported for destructive tag action '{action}' to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
+            return json.dumps(
+                {
+                    "error": f"scope='all' is not supported for destructive tag action '{action}' to prevent unintentional data loss. Please specify 'workspace' or 'global'."
+                }
+            )
         targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
         if not targets:
             return _scope_error(scope)
@@ -971,7 +999,10 @@ def create_server(
         if len(targets) == 1:
             return json.dumps(run_manage_tags(targets[0][1]), indent=2)
         return json.dumps(
-            [_source_wrapped(source, run_manage_tags(target_graph)) for source, target_graph in targets],
+            [
+                _source_wrapped(source, run_manage_tags(target_graph))
+                for source, target_graph in targets
+            ],
             indent=2,
         )
 
@@ -994,7 +1025,11 @@ def create_server(
         graph_mgr, _, global_graph_mgr = _get_ctx(ctx)
         normalized_scope = _normalize_scope(scope)
         if normalized_scope == "all":
-            return json.dumps({"error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."})
+            return json.dumps(
+                {
+                    "error": "scope='all' is not supported for destructive operations to prevent unintentional data loss. Please specify 'workspace' or 'global'."
+                }
+            )
         targets = _scoped_graphs(graph_mgr, global_graph_mgr, scope)
         if not targets:
             return _scope_error(scope)
@@ -1008,7 +1043,10 @@ def create_server(
         if len(targets) == 1:
             return json.dumps(merge_payload(targets[0][1]), indent=2)
         return json.dumps(
-            [_source_wrapped(source_name, merge_payload(target_graph)) for source_name, target_graph in targets],
+            [
+                _source_wrapped(source_name, merge_payload(target_graph))
+                for source_name, target_graph in targets
+            ],
             indent=2,
         )
 
@@ -1067,7 +1105,10 @@ def create_server(
             counts = targets[0][1].import_graph(data)
             return json.dumps(counts)
         return json.dumps(
-            [_source_wrapped(source, target_graph.import_graph(data)) for source, target_graph in targets],
+            [
+                _source_wrapped(source, target_graph.import_graph(data))
+                for source, target_graph in targets
+            ],
             indent=2,
         )
 
@@ -1086,7 +1127,10 @@ def create_server(
         if len(targets) == 1:
             return json.dumps(targets[0][1].memory_stats(), indent=2)
         return json.dumps(
-            [_source_wrapped(source, target_graph.memory_stats()) for source, target_graph in targets],
+            [
+                _source_wrapped(source, target_graph.memory_stats())
+                for source, target_graph in targets
+            ],
             indent=2,
         )
 
@@ -1173,7 +1217,10 @@ def create_server(
         if len(targets) == 1:
             return json.dumps(history_payload(targets[0][1]), indent=2)
         return json.dumps(
-            [_source_wrapped(source, history_payload(target_graph)) for source, target_graph in targets],
+            [
+                _source_wrapped(source, history_payload(target_graph))
+                for source, target_graph in targets
+            ],
             indent=2,
         )
 

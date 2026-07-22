@@ -110,7 +110,9 @@ async def test_forward_request_returns_jsonrpc_error_after_persistent_auth_failu
 async def test_forward_request_retries_alternate_candidate_token(monkeypatch, tmp_path):
     outputs: list[bytes] = []
     monkeypatch.setattr(stdio_proxy, "_write_stdout", lambda data: outputs.append(data))
-    monkeypatch.setattr(stdio_proxy, "load_auth_tokens", lambda path: ["stale-token", "fresh-token"])
+    monkeypatch.setattr(
+        stdio_proxy, "load_auth_tokens", lambda path: ["stale-token", "fresh-token"]
+    )
 
     client = _FakeClient(
         [
@@ -210,9 +212,7 @@ async def test_forward_request_catches_request_errors(monkeypatch, tmp_path, exc
 
 
 @pytest.mark.asyncio
-async def test_forward_request_converts_malformed_json_body_to_jsonrpc_error(
-    monkeypatch, tmp_path
-):
+async def test_forward_request_converts_malformed_json_body_to_jsonrpc_error(monkeypatch, tmp_path):
     outputs: list[bytes] = []
     monkeypatch.setattr(stdio_proxy, "_write_stdout", lambda data: outputs.append(data))
     monkeypatch.setattr(stdio_proxy, "load_auth_tokens", lambda path: [])
@@ -251,7 +251,7 @@ async def test_forward_request_ignores_malformed_empty_comment_and_keepalive_sse
                     b"event: ping\n"
                     b"data:\n"
                     b"data: not json\n"
-                    b"data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"ok\":true}}\n"
+                    b'data: {"jsonrpc":"2.0","id":9,"result":{"ok":true}}\n'
                 ),
                 headers={"content-type": "text/event-stream"},
             )
@@ -300,10 +300,18 @@ async def test_forward_request_rejects_non_jsonrpc_valid_json(monkeypatch, tmp_p
         [
             _FakeStreamResponse(status_code=200, body=b'{"not_jsonrpc": true}'),
             _FakeStreamResponse(status_code=200, body=b'[{"jsonrpc":"2.0","result":{}}]'),
-            _FakeStreamResponse(status_code=200, body=b'{"jsonrpc":"2.0","id":12,"result":{},"error":{}}'),
+            _FakeStreamResponse(
+                status_code=200, body=b'{"jsonrpc":"2.0","id":12,"result":{},"error":{}}'
+            ),
             _FakeStreamResponse(status_code=200, body=b'{"jsonrpc":"2.0","id":12}'),
-            _FakeStreamResponse(status_code=200, body=b'{"jsonrpc":"2.0","id":12,"error":{"code":"not-int","message":"foo"}}'),
-            _FakeStreamResponse(status_code=200, body=b'{"jsonrpc":"2.0","id":12,"error":{"code":-32000,"message":123}}'),
+            _FakeStreamResponse(
+                status_code=200,
+                body=b'{"jsonrpc":"2.0","id":12,"error":{"code":"not-int","message":"foo"}}',
+            ),
+            _FakeStreamResponse(
+                status_code=200,
+                body=b'{"jsonrpc":"2.0","id":12,"error":{"code":-32000,"message":123}}',
+            ),
         ]
     )
 
@@ -352,26 +360,37 @@ def test_strict_jsonrpc_validation():
 
     # Single message validation
     # Params must be structured (dict or list)
-    assert stdio_proxy._is_valid_single_jsonrpc_msg(
-        {"jsonrpc": "2.0", "method": "foo", "params": "invalid_string"}
-    ) is False
-    assert stdio_proxy._is_valid_single_jsonrpc_msg(
-        {"jsonrpc": "2.0", "method": "foo", "params": []}
-    ) is True
-    assert stdio_proxy._is_valid_single_jsonrpc_msg(
-        {"jsonrpc": "2.0", "method": "foo", "params": {}}
-    ) is True
+    assert (
+        stdio_proxy._is_valid_single_jsonrpc_msg(
+            {"jsonrpc": "2.0", "method": "foo", "params": "invalid_string"}
+        )
+        is False
+    )
+    assert (
+        stdio_proxy._is_valid_single_jsonrpc_msg({"jsonrpc": "2.0", "method": "foo", "params": []})
+        is True
+    )
+    assert (
+        stdio_proxy._is_valid_single_jsonrpc_msg({"jsonrpc": "2.0", "method": "foo", "params": {}})
+        is True
+    )
 
     # Error code cannot be bool
-    assert stdio_proxy._is_valid_single_jsonrpc_msg(
-        {"jsonrpc": "2.0", "id": 123, "error": {"code": True, "message": "msg"}}
-    ) is False
-    assert stdio_proxy._is_valid_single_jsonrpc_msg(
-        {"jsonrpc": "2.0", "id": 123, "error": {"code": -32600, "message": "msg"}}
-    ) is True
+    assert (
+        stdio_proxy._is_valid_single_jsonrpc_msg(
+            {"jsonrpc": "2.0", "id": 123, "error": {"code": True, "message": "msg"}}
+        )
+        is False
+    )
+    assert (
+        stdio_proxy._is_valid_single_jsonrpc_msg(
+            {"jsonrpc": "2.0", "id": 123, "error": {"code": -32600, "message": "msg"}}
+        )
+        is True
+    )
 
     # ID in response cannot be bool
-    assert stdio_proxy._is_valid_single_jsonrpc_msg(
-        {"jsonrpc": "2.0", "id": True, "result": {}}
-    ) is False
-
+    assert (
+        stdio_proxy._is_valid_single_jsonrpc_msg({"jsonrpc": "2.0", "id": True, "result": {}})
+        is False
+    )

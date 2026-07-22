@@ -24,6 +24,8 @@ from .models import (
     Tag,
 )
 
+_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+
 logger = logging.getLogger(__name__)
 
 _embedding_backfill_lock = threading.Lock()
@@ -454,9 +456,7 @@ class KnowledgeGraphManager:
                     assert oid is not None
                     for tag_name in tags:
                         self._apply_tag_to_observation(oid, tag_name)
-                    self._embed_observation(
-                        oid, content, embedding=new_emb, allow_fallback=False
-                    )
+                    self._embed_observation(oid, content, embedding=new_emb, allow_fallback=False)
                     if new_emb:
                         existing_embeddings.append(new_emb)
                     added.append(content)
@@ -1132,9 +1132,7 @@ class KnowledgeGraphManager:
             visible_pinned = pinned_rows
         else:
             visible_pinned = [row for row in pinned_rows if row["id"] in relevant_entity_ids]
-        result["pinned"] = [
-            {"name": r["name"], "type": r["entity_type"]} for r in visible_pinned
-        ]
+        result["pinned"] = [{"name": r["name"], "type": r["entity_type"]} for r in visible_pinned]
 
         # 3. Recent activity (scoped by project and/or current hint when available)
         result["recent_activity"] = self._recent_activity_for_context(
@@ -1146,17 +1144,17 @@ class KnowledgeGraphManager:
         )
 
         result["hint_matches"] = [
-                {
-                    "name": candidate["entity"].name,
-                    "type": candidate["entity"].entity_type,
-                    "snippets": candidate["snippets"],
-                    "score": round(candidate["score"], 4),
-                    "conflict": candidate["conflict"],
-                    "stale": candidate["stale"],
-                    "signals": candidate["signals"],
-                }
-                for candidate in hint_matches
-            ]
+            {
+                "name": candidate["entity"].name,
+                "type": candidate["entity"].entity_type,
+                "snippets": candidate["snippets"],
+                "score": round(candidate["score"], 4),
+                "conflict": candidate["conflict"],
+                "stale": candidate["stale"],
+                "signals": candidate["signals"],
+            }
+            for candidate in hint_matches
+        ]
 
         # 4. Stats summary
         total_entities = cx.execute(
@@ -1545,9 +1543,7 @@ class KnowledgeGraphManager:
             ):
                 continue
 
-            filtered.append(
-                {"action": row["action"], "summary": summary, "at": row["created_at"]}
-            )
+            filtered.append({"action": row["action"], "summary": summary, "at": row["created_at"]})
             if len(filtered) >= limit:
                 break
 
@@ -1756,11 +1752,11 @@ class KnowledgeGraphManager:
 
     @staticmethod
     def _normalize_memory_text(text: str) -> str:
-        return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+        return " ".join(_WORD_PATTERN.findall(text.lower()))
 
     @staticmethod
     def _tokenize_memory_text(text: str) -> set[str]:
-        return set(re.findall(r"[a-z0-9]+", text.lower()))
+        return set(_WORD_PATTERN.findall(text.lower()))
 
     def _should_scope_memory_context_hint(self, hint: str, query_tokens: set[str]) -> bool:
         if not hint.strip():
@@ -2298,21 +2294,26 @@ class KnowledgeGraphManager:
             live_ids,
         ).fetchall()
         obs_by_entity: dict[int, list[Observation]] = {}
-        for r in obs_rows:
-            obs_by_entity.setdefault(r["entity_id"], []).append(
-                Observation(
-                    id=r["id"],
-                    entity_id=r["entity_id"],
-                    content=r["content"],
-                    source=r["source"],
-                    confidence=r["confidence"],
-                    importance=r["importance"] if "importance" in r.keys() else 0.5,
-                    obs_type=r["obs_type"] if "obs_type" in r.keys() else "",
-                    version=r["version"],
-                    created_at=r["created_at"],
-                    updated_at=r["updated_at"],
+        if obs_rows:
+            first_row_keys = obs_rows[0].keys()
+            has_importance = "importance" in first_row_keys
+            has_obs_type = "obs_type" in first_row_keys
+
+            for r in obs_rows:
+                obs_by_entity.setdefault(r["entity_id"], []).append(
+                    Observation(
+                        id=r["id"],
+                        entity_id=r["entity_id"],
+                        content=r["content"],
+                        source=r["source"],
+                        confidence=r["confidence"],
+                        importance=r["importance"] if has_importance else 0.5,
+                        obs_type=r["obs_type"] if has_obs_type else "",
+                        version=r["version"],
+                        created_at=r["created_at"],
+                        updated_at=r["updated_at"],
+                    )
                 )
-            )
 
         # Batch fetch tags
         tag_rows = cx.execute(

@@ -32,17 +32,13 @@ def inspect_wheel(wheel_path: Path) -> None:
         if missing_members:
             raise SystemExit(f"wheel missing package files: {missing_members}")
 
-        entry_point_files = [
-            name for name in names if name.endswith(".dist-info/entry_points.txt")
-        ]
+        entry_point_files = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
         if len(entry_point_files) != 1:
             raise SystemExit(f"expected one entry_points.txt, found {entry_point_files}")
 
         entry_points = wheel.read(entry_point_files[0]).decode("utf-8")
         missing_entry_points = sorted(
-            entry_point
-            for entry_point in REQUIRED_ENTRY_POINTS
-            if entry_point not in entry_points
+            entry_point for entry_point in REQUIRED_ENTRY_POINTS if entry_point not in entry_points
         )
         if missing_entry_points:
             raise SystemExit(f"wheel missing console scripts: {missing_entry_points}")

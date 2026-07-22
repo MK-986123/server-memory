@@ -259,10 +259,9 @@ def test_search_schedules_embedding_backfill_on_first_search(monkeypatch, db_wit
     assert scheduled == ["scheduled"]
 
     # Search should remain read-only and leave backfill to the background worker.
-    count = (
-        db_with_embeddings.cx.execute("SELECT COUNT(*) c FROM entity_embeddings")
-        .fetchone()["c"]
-    )
+    count = db_with_embeddings.cx.execute("SELECT COUNT(*) c FROM entity_embeddings").fetchone()[
+        "c"
+    ]
     assert count == 0
 
 
