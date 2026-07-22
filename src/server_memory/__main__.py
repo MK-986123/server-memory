@@ -18,7 +18,9 @@ def _package_version() -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the server-memory MCP stdio server.")
-    parser.add_argument("--version", action="version", version=f"server-memory {_package_version()}")
+    parser.add_argument(
+        "--version", action="version", version=f"server-memory {_package_version()}"
+    )
     parser.parse_args()
 
     config = MemoryConfig()

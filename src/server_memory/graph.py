@@ -456,9 +456,7 @@ class KnowledgeGraphManager:
                     assert oid is not None
                     for tag_name in tags:
                         self._apply_tag_to_observation(oid, tag_name)
-                    self._embed_observation(
-                        oid, content, embedding=new_emb, allow_fallback=False
-                    )
+                    self._embed_observation(oid, content, embedding=new_emb, allow_fallback=False)
                     if new_emb:
                         existing_embeddings.append(new_emb)
                     added.append(content)
@@ -1134,9 +1132,7 @@ class KnowledgeGraphManager:
             visible_pinned = pinned_rows
         else:
             visible_pinned = [row for row in pinned_rows if row["id"] in relevant_entity_ids]
-        result["pinned"] = [
-            {"name": r["name"], "type": r["entity_type"]} for r in visible_pinned
-        ]
+        result["pinned"] = [{"name": r["name"], "type": r["entity_type"]} for r in visible_pinned]
 
         # 3. Recent activity (scoped by project and/or current hint when available)
         result["recent_activity"] = self._recent_activity_for_context(
@@ -1148,17 +1144,17 @@ class KnowledgeGraphManager:
         )
 
         result["hint_matches"] = [
-                {
-                    "name": candidate["entity"].name,
-                    "type": candidate["entity"].entity_type,
-                    "snippets": candidate["snippets"],
-                    "score": round(candidate["score"], 4),
-                    "conflict": candidate["conflict"],
-                    "stale": candidate["stale"],
-                    "signals": candidate["signals"],
-                }
-                for candidate in hint_matches
-            ]
+            {
+                "name": candidate["entity"].name,
+                "type": candidate["entity"].entity_type,
+                "snippets": candidate["snippets"],
+                "score": round(candidate["score"], 4),
+                "conflict": candidate["conflict"],
+                "stale": candidate["stale"],
+                "signals": candidate["signals"],
+            }
+            for candidate in hint_matches
+        ]
 
         # 4. Stats summary
         total_entities = cx.execute(
@@ -1547,9 +1543,7 @@ class KnowledgeGraphManager:
             ):
                 continue
 
-            filtered.append(
-                {"action": row["action"], "summary": summary, "at": row["created_at"]}
-            )
+            filtered.append({"action": row["action"], "summary": summary, "at": row["created_at"]})
             if len(filtered) >= limit:
                 break
 
@@ -2301,17 +2295,9 @@ class KnowledgeGraphManager:
         ).fetchall()
         obs_by_entity: dict[int, list[Observation]] = {}
         if obs_rows:
-            try:
-                obs_rows[0]["importance"]
-                has_importance = True
-            except IndexError:
-                has_importance = False
-
-            try:
-                obs_rows[0]["obs_type"]
-                has_obs_type = True
-            except IndexError:
-                has_obs_type = False
+            first_row_keys = obs_rows[0].keys()
+            has_importance = "importance" in first_row_keys
+            has_obs_type = "obs_type" in first_row_keys
 
             for r in obs_rows:
                 obs_by_entity.setdefault(r["entity_id"], []).append(

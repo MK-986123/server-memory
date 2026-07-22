@@ -241,7 +241,9 @@ def test_memory_context_with_embeddings_missing_stays_read_only_under_write_lock
         assert scheduled == ["scheduled"]
         assert ctx["hint_matches"]
         assert ctx["hint_matches"][0]["name"] == "Embedding Lock Notes"
-        assert writer_db.cx.execute("SELECT COUNT(*) AS c FROM entity_embeddings").fetchone()["c"] == 0
+        assert (
+            writer_db.cx.execute("SELECT COUNT(*) AS c FROM entity_embeddings").fetchone()["c"] == 0
+        )
     finally:
         locker.rollback()
         locker.close()
@@ -758,3 +760,37 @@ def test_read_graph_uses_batch(graph):
     kg = graph.read_graph()
     assert len(kg.entities) == 2
     assert len(kg.relations) == 1
+
+
+def test_load_entities_batch_handles_legacy_schema():
+    """Ensure _load_entities_batch tolerates missing importance and obs_type columns."""
+
+    from server_memory.db import Database
+    from server_memory.graph import KnowledgeGraphManager
+
+    db = Database(":memory:")
+    db.open()
+    graph = KnowledgeGraphManager(db)
+
+    conn = db.cx
+
+    # Force schema migration backward - drop the columns to test the missing column logic
+
+    conn.execute(
+        "CREATE TABLE observations_legacy AS SELECT id, entity_id, content, source, confidence, version, metadata_json, created_at, updated_at, deleted_at FROM observations"
+    )
+    conn.execute("DROP TABLE observations")
+    conn.execute("ALTER TABLE observations_legacy RENAME TO observations")
+
+    graph.create_entities(
+        [{"name": "LegacyNode", "entityType": "test", "observations": ["legacy data"]}]
+    )
+
+    entity = graph.get_entity_by_name("LegacyNode")
+    assert entity is not None
+    assert len(entity.observations) == 1
+
+    obs = entity.observations[0]
+    assert obs.content == "legacy data"
+    assert obs.importance == 0.5
+    assert obs.obs_type == ""

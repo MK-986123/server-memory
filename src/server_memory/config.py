@@ -30,7 +30,9 @@ def env_path_or_default(name: str, default: Path) -> Path:
 class MemoryConfig:
     """Configuration resolved from environment variables and workspace context."""
 
-    db_path: Path = field(default_factory=lambda: env_path_or_default("MEMORY_DB_PATH", default_db_path()))
+    db_path: Path = field(
+        default_factory=lambda: env_path_or_default("MEMORY_DB_PATH", default_db_path())
+    )
     compression_level: CompressionLevel = field(
         default_factory=lambda: CompressionLevel(
             int(os.environ.get("MEMORY_COMPRESSION_LEVEL", "4"))  # Default AUTO
@@ -58,8 +60,7 @@ class MemoryConfig:
     )
     http_auth_enabled: bool = field(
         default_factory=lambda: (
-            os.environ.get("MEMORY_HTTP_AUTH_ENABLED", "true").lower()
-            in ("true", "1", "yes")
+            os.environ.get("MEMORY_HTTP_AUTH_ENABLED", "true").lower() in ("true", "1", "yes")
         )
     )
     auth_token_path: Path = field(
