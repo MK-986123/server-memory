@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 from contextlib import contextmanager, suppress
@@ -193,6 +194,22 @@ CREATE TABLE IF NOT EXISTS observation_embeddings (
 """
 
 
+def _prepare_private_sqlite_file(path: str | Path) -> None:
+    """Create or tighten a filesystem-backed SQLite file to owner-only access on POSIX."""
+    if os.name != "posix":
+        return
+
+    raw_path = os.fspath(path)
+    if raw_path == ":memory:":
+        return
+
+    fd = os.open(raw_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
 class Database:
     """Manages SQLite connection with WAL mode, FK enforcement, and FTS5."""
 
@@ -206,6 +223,7 @@ class Database:
 
     def open(self) -> None:
         try:
+            _prepare_private_sqlite_file(self.db_path)
             self.conn = sqlite3.connect(
                 self.db_path,
                 timeout=self.CONNECT_TIMEOUT_SECONDS,
@@ -491,6 +509,7 @@ class Database:
     def backup(self, dest_path: str | Path) -> None:
         """Create a full backup of the database."""
         assert self.conn is not None
+        _prepare_private_sqlite_file(dest_path)
         dest = sqlite3.connect(str(dest_path))
         try:
             self.conn.backup(dest)
