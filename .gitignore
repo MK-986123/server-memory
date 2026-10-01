@@ -27,6 +27,10 @@ venv/
 auth.token
 *.log
 
+# Benchmark runtime outputs (keep directory via .gitkeep)
+benchmark/.runtime/
+benchmark/results/*.json
+
 # Editor and OS clutter
 .vscode/
 .idea/

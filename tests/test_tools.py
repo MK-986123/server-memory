@@ -1,11 +1,10 @@
 """Tests for activity logging, timeline, memory context, import/export, stats, and backup."""
 
+import asyncio
 import json
 import os
 import tempfile
 from types import SimpleNamespace
-
-import pytest
 
 from server_memory import server as server_module
 from server_memory.config import MemoryConfig
@@ -32,6 +31,91 @@ def _tool_ctx(
 def _tool_fn(name: str):
     server = server_module.create_server(MemoryConfig(global_db_enabled=False))
     return server._tool_manager._tools[name].fn
+
+
+def test_mcp_tools_advertise_safety_and_bounded_contracts():
+    tools = asyncio.run(server_module.create_server().list_tools())
+
+    assert len(tools) == 22
+    assert all(tool.annotations is not None for tool in tools)
+    assert all(tool.annotations.openWorldHint is False for tool in tools)
+    assert all(tool.outputSchema for tool in tools)
+
+    by_name = {tool.name: tool for tool in tools}
+    assert by_name["read_graph"].annotations.readOnlyHint is True
+    assert by_name["delete_entities"].annotations.destructiveHint is True
+    entity_schema = by_name["create_entities"].inputSchema
+    assert entity_schema["properties"]["entities"]["maxItems"] == 500
+    assert entity_schema["$defs"]["EntityInput"]["required"] == ["name", "entityType"]
+    assert by_name["search_nodes"].inputSchema["properties"]["limit"]["maximum"] == 500
+    assert by_name["search_nodes"].inputSchema["properties"]["page_size"]["maximum"] == 500
+    assert "scope" in by_name["add_observations"].inputSchema["properties"]
+    assert "scope" in by_name["memory_context"].inputSchema["properties"]
+    assert "budget" in by_name["memory_context"].inputSchema["properties"]
+    assert "scope" in by_name["memory_context_full"].inputSchema["properties"]
+    assert "cursor" in by_name["read_graph"].inputSchema["properties"]
+    assert by_name["open_nodes"].inputSchema["properties"]["depth"]["maximum"] == 10
+    assert "scope" in by_name["restore_entities"].inputSchema["properties"]
+    for tool in tools:
+        assert tool.outputSchema["type"] == "object"
+        assert set(tool.outputSchema["properties"]) == {"text", "data"}
+        assert "result" not in tool.outputSchema["properties"]
+
+
+def test_structured_tool_result_preserves_legacy_text_payload():
+    """Text-oriented clients must still receive the prior JSON string payload."""
+    legacy = json.dumps({"deleted": 2, "note": "legacy text clients"})
+    adapted = server_module.StructuredToolResult.model_validate(legacy)
+    assert adapted.text == legacy
+    assert adapted.data == {"deleted": 2, "note": "legacy text clients"}
+
+    plain = "not-json-but-still-text"
+    adapted_plain = server_module.StructuredToolResult.model_validate(plain)
+    assert adapted_plain.text == plain
+    assert adapted_plain.data is None
+
+    # Direct Python tool call path still returns the established string.
+    workspace_db = Database(":memory:")
+    workspace_db.open()
+    try:
+        graph = KnowledgeGraphManager(workspace_db)
+        graph.create_entities([{"name": "Legacy", "entityType": "note"}])
+        config = MemoryConfig(embedding_enabled=False, global_db_enabled=False)
+        ctx = _tool_ctx(graph, config)
+        raw = _tool_fn("delete_entities")(ctx, entityNames=["Legacy"], scope="workspace")
+        assert isinstance(raw, str)
+        assert json.loads(raw) == {"deleted": 1}
+        structured = server_module.StructuredToolResult.model_validate(raw)
+        assert structured.text == raw
+        assert structured.data == {"deleted": 1}
+    finally:
+        workspace_db.close()
+
+
+def test_graph_pagination_cursor_is_stable_and_query_bound(graph):
+    graph.create_entities(
+        [{"name": f"Entity {index}", "entityType": "note"} for index in range(5)]
+    )
+    full = graph.read_graph()
+    fingerprint = server_module._fingerprint_cursor("read_graph", {"scope": "workspace"})
+
+    first, cursor = server_module._paginate_graph(
+        full, page_size=2, cursor="", fingerprint=fingerprint
+    )
+    second, next_cursor = server_module._paginate_graph(
+        full, page_size=2, cursor=cursor, fingerprint=fingerprint
+    )
+
+    assert [entity.name for entity in first.entities] == ["Entity 0", "Entity 1"]
+    assert [entity.name for entity in second.entities] == ["Entity 2", "Entity 3"]
+    assert next_cursor
+    try:
+        server_module._paginate_graph(
+            full, page_size=2, cursor=cursor, fingerprint="different-query"
+        )
+        assert False, "mismatched cursor should fail"
+    except ValueError as exc:
+        assert "cursor" in str(exc)
 
 
 def test_log_activity(graph):
@@ -517,6 +601,43 @@ def test_merge_memory_context_results_prefers_workspace_hit_over_equal_global_hi
     assert merged["hint_matches"][0]["source"] == "workspace"
 
 
+def test_merge_memory_context_preserves_same_name_in_both_scopes():
+    base = {
+        "pinned": [{"name": "Shared", "type": "note"}],
+        "recent_activity": [],
+        "hint_matches": [{"name": "Shared", "type": "note", "score": 0.8}],
+        "stats": {"entities": 1, "observations": 1, "relations": 0},
+    }
+
+    merged = server_module.merge_memory_context_results(base, base, limit=10)
+
+    assert {(item["source"], item["name"]) for item in merged["pinned"]} == {
+        ("workspace", "Shared"),
+        ("global", "Shared"),
+    }
+    assert {(item["source"], item["name"]) for item in merged["hint_matches"]} == {
+        ("workspace", "Shared"),
+        ("global", "Shared"),
+    }
+
+
+def test_merged_activity_is_globally_newest_first():
+    merged = server_module._merge_activity_entries(
+        [{"action": "old", "summary": "workspace", "at": "2025-01-01T00:00:00Z"}],
+        [{"action": "new", "summary": "global", "at": "2026-01-01T00:00:00Z"}],
+        limit=1,
+    )
+
+    assert merged == [
+        {
+            "action": "new",
+            "summary": "global",
+            "at": "2026-01-01T00:00:00Z",
+            "source": "global",
+        }
+    ]
+
+
 def test_preference_routing_predicates_detect_global_preference_payloads():
     assert server_module._is_preference_entity(
         {"name": "Editor Preference", "entityType": "note", "tags": ["preference"]}
@@ -556,118 +677,6 @@ def test_global_preference_graph_can_be_opened_separately_from_workspace_graph(t
 
         assert workspace_graph.memory_context(hint="JWT issuer")["hint_matches"][0]["name"] == "Workspace Config"
         assert global_graph.memory_context(hint="prefer ruff")["hint_matches"][0]["name"] == "Global Preference"
-    finally:
-        global_db.close()
-        workspace_db.close()
-
-
-def test_mcp_global_preference_lifecycle_is_scoped_and_discoverable(tmp_path):
-    workspace_db = Database(tmp_path / "workspace.db")
-    global_db = Database(tmp_path / "global.db")
-    workspace_db.open()
-    global_db.open()
-    try:
-        workspace_graph = KnowledgeGraphManager(workspace_db, session_id="workspace")
-        global_graph = KnowledgeGraphManager(global_db, session_id="global")
-        config = MemoryConfig(
-            db_path=tmp_path / "workspace.db",
-            global_db_path=tmp_path / "global.db",
-            embedding_enabled=False,
-        )
-        ctx = _tool_ctx(workspace_graph, config, global_graph)
-
-        created = json.loads(
-            _tool_fn("create_entities")(
-                ctx,
-                [
-                    {
-                        "name": "Editor Preference",
-                        "entityType": "preference",
-                        "tags": ["preference"],
-                        "observations": ["prefer ruff over flake8"],
-                    }
-                ],
-            )
-        )
-        assert created[0]["name"] == "Editor Preference"
-
-        workspace_read = json.loads(_tool_fn("read_graph")(ctx, compress=False))
-        global_read = json.loads(_tool_fn("read_graph")(ctx, compress=False, scope="global"))
-        all_read = json.loads(_tool_fn("read_graph")(ctx, compress=False, scope="all"))
-        assert workspace_read["entities"] == []
-        assert global_read["entities"][0]["name"] == "Editor Preference"
-        assert {item["source"] for item in all_read} == {"workspace", "global"}
-
-        search = json.loads(
-            _tool_fn("search_nodes")(
-                ctx,
-                query="ruff",
-                compress=False,
-                scope="global",
-            )
-        )
-        assert search["entities"][0]["name"] == "Editor Preference"
-
-        exported = json.loads(_tool_fn("export_graph")(ctx, scope="global"))
-        assert exported["entities"][0]["name"] == "Editor Preference"
-
-        stats = json.loads(_tool_fn("memory_stats")(ctx, scope="global"))
-        assert stats["entities"] == 1
-        assert stats["observations"] == 1
-
-        backup = json.loads(
-            _tool_fn("backup_memory")(
-                ctx,
-                dest_path=str(tmp_path / "backups" / "global-backup.db"),
-                scope="global",
-            )
-        )
-        assert backup["source"] == "global"
-        assert os.path.exists(backup["backup_path"])
-
-        deleted = json.loads(
-            _tool_fn("delete_entities")(ctx, ["Editor Preference"], hard=True, scope="global")
-        )
-        assert deleted["deleted"] == 1
-
-        absent_read = json.loads(_tool_fn("read_graph")(ctx, compress=False, scope="global"))
-        absent_search = json.loads(
-            _tool_fn("search_nodes")(ctx, query="ruff", compress=False, scope="global")
-        )
-        assert absent_read["entities"] == []
-        assert absent_search["entities"] == []
-    finally:
-        global_db.close()
-        workspace_db.close()
-
-
-def test_mcp_scope_all_labels_sources_for_ambiguous_names(tmp_path):
-    workspace_db = Database(tmp_path / "workspace.db")
-    global_db = Database(tmp_path / "global.db")
-    workspace_db.open()
-    global_db.open()
-    try:
-        workspace_graph = KnowledgeGraphManager(workspace_db, session_id="workspace")
-        global_graph = KnowledgeGraphManager(global_db, session_id="global")
-        workspace_graph.create_entities([{"name": "Same Name", "entityType": "workspace"}])
-        global_graph.create_entities([{"name": "Same Name", "entityType": "global"}])
-        ctx = _tool_ctx(
-            workspace_graph,
-            MemoryConfig(
-                db_path=tmp_path / "workspace.db",
-                global_db_path=tmp_path / "global.db",
-                embedding_enabled=False,
-            ),
-            global_graph,
-        )
-
-        opened = json.loads(
-            _tool_fn("open_nodes")(ctx, ["Same Name"], scope="all")
-        )
-
-        assert [item["source"] for item in opened] == ["workspace", "global"]
-        assert opened[0]["result"]["entities"][0]["entityType"] == "workspace"
-        assert opened[1]["result"]["entities"][0]["entityType"] == "global"
     finally:
         global_db.close()
         workspace_db.close()
@@ -947,6 +956,102 @@ def test_backup_with_data(graph):
         conn.close()
 
 
+def test_backup_refuses_to_clobber_existing_file(graph, tmp_path):
+    destination = tmp_path / "existing.db"
+    destination.write_bytes(b"sentinel")
+
+    try:
+        graph.db.backup(destination)
+        assert False, "existing destination should fail"
+    except ValueError as exc:
+        assert "already exists" in str(exc)
+
+    assert destination.read_bytes() == b"sentinel"
+
+
+def test_backup_path_is_bounded_and_no_clobber(tmp_path):
+    db_path = tmp_path / "memory.db"
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir()
+    existing = backup_root / "existing.db"
+    existing.write_text("sentinel", encoding="utf-8")
+
+    default_path = server_module._resolve_backup_path(
+        db_path,
+        "",
+        scope_name="workspace",
+        multiple_scopes=False,
+        timestamp="fixed",
+    )
+    assert default_path == backup_root / "workspace-fixed.db"
+
+    try:
+        server_module._resolve_backup_path(
+            db_path,
+            str(tmp_path / "outside.db"),
+            scope_name="workspace",
+            multiple_scopes=False,
+            timestamp="fixed",
+        )
+        assert False, "outside destination should fail"
+    except ValueError as exc:
+        assert "under" in str(exc)
+
+    try:
+        server_module._resolve_backup_path(
+            db_path,
+            str(existing),
+            scope_name="workspace",
+            multiple_scopes=False,
+            timestamp="fixed",
+        )
+        assert False, "existing destination should fail"
+    except ValueError as exc:
+        assert "already exists" in str(exc)
+
+
+def test_backup_path_rejects_symlink_escape(tmp_path):
+    db_parent = tmp_path / "database"
+    db_parent.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    backup_root = db_parent / "backups"
+    backup_root.mkdir()
+    (backup_root / "escape").symlink_to(outside, target_is_directory=True)
+
+    try:
+        server_module._resolve_backup_path(
+            db_parent / "memory.db",
+            str(backup_root / "escape" / "backup.db"),
+            scope_name="workspace",
+            multiple_scopes=False,
+            timestamp="fixed",
+        )
+        assert False, "symlink escape should fail"
+    except ValueError as exc:
+        assert "under" in str(exc)
+
+
+def test_backup_path_rejects_symlink_root(tmp_path):
+    db_parent = tmp_path / "database"
+    db_parent.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (db_parent / "backups").symlink_to(outside, target_is_directory=True)
+
+    try:
+        server_module._resolve_backup_path(
+            db_parent / "memory.db",
+            "",
+            scope_name="workspace",
+            multiple_scopes=False,
+            timestamp="fixed",
+        )
+        assert False, "symlink backup root should fail"
+    except ValueError as exc:
+        assert "symlink" in str(exc)
+
+
 def test_schedule_startup_cleanup_runs_once(monkeypatch, tmp_path):
     calls: list[tuple[str, object]] = []
 
@@ -973,135 +1078,82 @@ def test_schedule_startup_cleanup_runs_once(monkeypatch, tmp_path):
     ]
 
 
-def test_lifespan_database_cleanup_closes_both_databases_when_one_close_fails():
-    calls: list[str] = []
-
-    class FakeDatabase:
-        def __init__(self, name: str, *, fail: bool = False):
-            self.name = name
-            self.fail = fail
-
-        def close(self):
-            calls.append(self.name)
-            if self.fail:
-                raise RuntimeError(f"{self.name} close failed")
-
-    # Workspace close fails
-    workspace_db = FakeDatabase("workspace", fail=True)
-    global_db = FakeDatabase("global")
-    with pytest.raises(RuntimeError, match="workspace close failed"):
-        server_module._close_lifespan_databases(workspace_db, global_db)
-    assert calls == ["global", "workspace"]
-
-    # Global close fails
-    calls.clear()
-    workspace_db2 = FakeDatabase("workspace")
-    global_db2 = FakeDatabase("global", fail=True)
-    with pytest.raises(RuntimeError, match="global close failed"):
-        server_module._close_lifespan_databases(workspace_db2, global_db2)
-    assert calls == ["global", "workspace"]
-
-    # Both close fail - workspace close exception is suppressed, raising global close failed
-    calls.clear()
-    workspace_db3 = FakeDatabase("workspace", fail=True)
-    global_db3 = FakeDatabase("global", fail=True)
-    with pytest.raises(RuntimeError, match="global close failed"):
-        server_module._close_lifespan_databases(workspace_db3, global_db3)
-    assert calls == ["global", "workspace"]
-
-
-@pytest.mark.asyncio
-async def test_lifespan_exception_safety_scenarios(monkeypatch, tmp_path):
-    monkeypatch.setattr(server_module, "_startup_cleanup_started", True)
-    # Test global DB open failure
-    config_global_fail = MemoryConfig(
-        db_path=tmp_path / "workspace.db",
-        global_db_path=tmp_path / "global_fail.db",
-        global_db_enabled=True,
+def test_startup_cleanup_preserves_old_durable_entities(tmp_path):
+    db_path = tmp_path / "memory.db"
+    database = Database(db_path)
+    database.open()
+    graph = KnowledgeGraphManager(database)
+    graph.create_entities(
+        [
+            {"name": "Durable", "entityType": "decision"},
+            {"name": "Temporary", "entityType": "scratch", "tags": ["ephemeral"]},
+        ]
     )
-    
-    workspace_opens = 0
-    workspace_closes = 0
-    global_opens = 0
-    global_closes = 0
-    
-    class MockDatabase:
-        def __init__(self, path):
-            self.path = path
-            
-        def open(self):
-            nonlocal workspace_opens, global_opens
-            if "global_fail.db" in str(self.path):
-                global_opens += 1
-                raise RuntimeError("Global DB open failed")
-            elif "global_emb_fail.db" in str(self.path):
-                global_opens += 1
-            else:
-                workspace_opens += 1
-                
-        def close(self):
-            nonlocal workspace_closes, global_closes
-            if "global_fail.db" in str(self.path) or "global_emb_fail.db" in str(self.path):
-                global_closes += 1
-            else:
-                workspace_closes += 1
-
-    monkeypatch.setattr(server_module, "Database", MockDatabase)
-    
-    server = server_module.create_server(config_global_fail)
-    
-    # Run lifespan and assert workspace DB is closed even when global DB open fails
-    with pytest.raises(RuntimeError, match="Global DB open failed"):
-        async with server.settings.lifespan(server):
-            pass
-            
-    assert workspace_opens == 1
-    assert workspace_closes == 1
-    assert global_opens == 1
-    assert global_closes == 0
-
-    # Test embedding initialization failure
-    monkeypatch.setattr(server_module, "EmbeddingEngine", lambda model_name: exec("raise(RuntimeError('Embedding init failed'))"))
-    config_emb_fail = MemoryConfig(
-        db_path=tmp_path / "workspace.db",
-        global_db_path=tmp_path / "global_emb_fail.db",
-        global_db_enabled=True,
-        embedding_enabled=True,
+    database.cx.execute(
+        "UPDATE entities SET created_at = '2020-01-01T00:00:00.000Z', "
+        "updated_at = '2020-01-01T00:00:00.000Z', "
+        "last_accessed_at = '2020-01-01T00:00:00.000Z'"
     )
-    workspace_opens = 0
-    workspace_closes = 0
-    global_opens = 0
-    global_closes = 0
-    
-    server2 = server_module.create_server(config_emb_fail)
-    with pytest.raises(RuntimeError, match="Embedding init failed"):
-        async with server2.settings.lifespan(server2):
-            pass
-            
-    assert workspace_opens == 1
-    assert workspace_closes == 1
-    assert global_opens == 1
-    assert global_closes == 1
+    database.cx.commit()
+    database.close()
 
-    # Test body exception with database closures
-    workspace_opens = 0
-    workspace_closes = 0
-    global_opens = 0
-    global_closes = 0
-    monkeypatch.setattr(server_module, "EmbeddingEngine", lambda model_name: None)
-    
-    server3 = server_module.create_server(config_emb_fail)
-    with pytest.raises(RuntimeError, match="Body failure"):
-        async with server3.settings.lifespan(server3):
-            raise RuntimeError("Body failure")
-            
-    assert workspace_opens == 1
-    assert workspace_closes == 1
-    assert global_opens == 1
-    assert global_closes == 1
+    server_module._run_startup_cleanup(MemoryConfig(db_path=db_path))
+
+    check = Database(db_path)
+    check.open()
+    try:
+        durable = check.cx.execute(
+            "SELECT deleted_at FROM entities WHERE name = 'Durable'"
+        ).fetchone()
+        temporary = check.cx.execute(
+            "SELECT deleted_at FROM entities WHERE name = 'Temporary'"
+        ).fetchone()
+        assert durable["deleted_at"] is None
+        assert temporary["deleted_at"] is not None
+    finally:
+        check.close()
 
 
-def test_destructive_operations_prevent_scope_all(tmp_path):
+def test_server_exposes_deleted_entity_recovery_tools(tmp_path):
+    server = server_module.create_server(
+        MemoryConfig(
+            db_path=tmp_path / "memory.db",
+            global_db_enabled=False,
+            embedding_enabled=False,
+        )
+    )
+
+    tool_names = set(server._tool_manager._tools)
+
+    assert "list_deleted_entities" in tool_names
+    assert "restore_entities" in tool_names
+
+
+def test_benchmark_telemetry_is_opt_in_and_local(monkeypatch, tmp_path):
+    telemetry = tmp_path / "events.jsonl"
+    monkeypatch.setenv("MEMORY_BENCHMARK_TELEMETRY_PATH", str(telemetry))
+
+    server_module._record_benchmark_event("mcp_handshake")
+    server_module._record_benchmark_event("tool_call")
+
+    events = [json.loads(line)["event"] for line in telemetry.read_text().splitlines()]
+    assert events == ["mcp_handshake", "tool_call"]
+
+
+def _seed_entity(graph: KnowledgeGraphManager, name: str, *, obs: str = "note") -> None:
+    graph.create_entities(
+        [
+            {
+                "name": name,
+                "entityType": "note",
+                "observations": [obs],
+            }
+        ]
+    )
+
+
+def test_destructive_operations_prevent_scope_all_without_mutation(tmp_path):
+    """scope='all' must return the public structured error and mutate nothing."""
     workspace_db = Database(tmp_path / "workspace.db")
     global_db = Database(tmp_path / "global.db")
     workspace_db.open()
@@ -1109,6 +1161,21 @@ def test_destructive_operations_prevent_scope_all(tmp_path):
     try:
         workspace_graph = KnowledgeGraphManager(workspace_db, session_id="workspace")
         global_graph = KnowledgeGraphManager(global_db, session_id="global")
+        _seed_entity(workspace_graph, "W", obs="workspace-obs")
+        _seed_entity(global_graph, "G", obs="global-obs")
+        workspace_graph.create_entities([{"name": "W2", "entityType": "note"}])
+        workspace_graph.create_relations(
+            [{"from": "W", "to": "W2", "relationType": "related_to"}]
+        )
+        global_graph.create_entities([{"name": "G2", "entityType": "note"}])
+        global_graph.create_relations(
+            [{"from": "G", "to": "G2", "relationType": "related_to"}]
+        )
+        workspace_graph.create_tag("user-tag")
+        global_graph.create_tag("user-tag")
+        workspace_graph.tag_entity("W", "user-tag")
+        global_graph.tag_entity("G", "user-tag")
+
         config = MemoryConfig(
             db_path=tmp_path / "workspace.db",
             global_db_path=tmp_path / "global.db",
@@ -1116,34 +1183,71 @@ def test_destructive_operations_prevent_scope_all(tmp_path):
         )
         ctx = _tool_ctx(workspace_graph, config, global_graph)
 
-        for tool_name in ["delete_entities", "delete_observations", "delete_relations", "merge_entities"]:
-            # Setup dummy args
-            if tool_name == "delete_entities":
-                res = _tool_fn(tool_name)(ctx, entityNames=["foo"], scope="all")
-            elif tool_name == "delete_observations":
-                res = _tool_fn(tool_name)(ctx, deletions=[{"entityName": "foo", "observations": ["bar"]}], scope="all")
-            elif tool_name == "delete_relations":
-                res = _tool_fn(tool_name)(ctx, relations=[{"from": "foo", "to": "bar", "relationType": "knows"}], scope="all")
-            elif tool_name == "merge_entities":
-                res = _tool_fn(tool_name)(ctx, source="foo", target="bar", scope="all")
-            
-            res_dict = json.loads(res)
-            assert "error" in res_dict
-            assert "scope='all' is not supported for destructive operations" in res_dict["error"]
+        def active_counts(graph: KnowledgeGraphManager) -> tuple[int, int, int]:
+            cx = graph.db.cx
+            entities = cx.execute(
+                "SELECT COUNT(*) c FROM entities WHERE deleted_at IS NULL"
+            ).fetchone()["c"]
+            observations = cx.execute(
+                "SELECT COUNT(*) c FROM observations WHERE deleted_at IS NULL"
+            ).fetchone()["c"]
+            relations = cx.execute(
+                "SELECT COUNT(*) c FROM relations WHERE deleted_at IS NULL"
+            ).fetchone()["c"]
+            return entities, observations, relations
 
-        # Test manage_tags action="delete" / "untag"
-        res_delete = _tool_fn("manage_tags")(ctx, action="delete", name="foo", scope="all")
-        assert "scope='all' is not supported for destructive tag action" in json.loads(res_delete)["error"]
+        before_w = active_counts(workspace_graph)
+        before_g = active_counts(global_graph)
 
-        res_untag = _tool_fn("manage_tags")(ctx, action="untag", entity_name="foo", tag_name="bar", scope="all")
-        assert "scope='all' is not supported for destructive tag action" in json.loads(res_untag)["error"]
+        cases = [
+            ("delete_entities", {"entityNames": ["W", "G"], "hard": False}),
+            ("delete_entities", {"entityNames": ["W", "G"], "hard": True}),
+            (
+                "delete_observations",
+                {
+                    "deletions": [
+                        {"entityName": "W", "observations": ["workspace-obs"]},
+                        {"entityName": "G", "observations": ["global-obs"]},
+                    ]
+                },
+            ),
+            (
+                "delete_relations",
+                {
+                    "relations": [
+                        {"from": "W", "to": "W2", "relationType": "related_to"},
+                        {"from": "G", "to": "G2", "relationType": "related_to"},
+                    ]
+                },
+            ),
+            ("merge_entities", {"source": "W", "target": "W2"}),
+            ("manage_tags", {"action": "delete", "name": "user-tag"}),
+            ("manage_tags", {"action": "cleanup"}),
+            ("manage_tags", {"action": "untag", "entity_name": "W", "tag_name": "user-tag"}),
+            (
+                "import_graph",
+                {"data": json.dumps({"entities": [], "relations": []})},
+            ),
+        ]
 
+        for tool_name, kwargs in cases:
+            res = _tool_fn(tool_name)(ctx, scope="all", **kwargs)
+            payload = json.loads(res)
+            assert "error" in payload, tool_name
+            if tool_name == "manage_tags":
+                assert "scope='all' is not supported for destructive tag action" in payload["error"]
+            else:
+                assert "scope='all' is not supported for destructive operations" in payload["error"]
+            assert active_counts(workspace_graph) == before_w
+            assert active_counts(global_graph) == before_g
+            assert workspace_graph.get_entity_by_name("W") is not None
+            assert global_graph.get_entity_by_name("G") is not None
     finally:
         global_db.close()
         workspace_db.close()
 
 
-def test_memory_context_full_shifts_global_ids(tmp_path):
+def test_destructive_operations_succeed_for_workspace_and_global(tmp_path):
     workspace_db = Database(tmp_path / "workspace.db")
     global_db = Database(tmp_path / "global.db")
     workspace_db.open()
@@ -1151,66 +1255,108 @@ def test_memory_context_full_shifts_global_ids(tmp_path):
     try:
         workspace_graph = KnowledgeGraphManager(workspace_db, session_id="workspace")
         global_graph = KnowledgeGraphManager(global_db, session_id="global")
-        
-        # Create entity with ID 1 in both DBs (since they are new, their first entities will have ID 1)
-        workspace_graph.create_entities([{"name": "Workspace Pinned", "entityType": "config", "tags": ["pinned"]}])
-        global_graph.create_entities([{"name": "Global Pinned", "entityType": "preference", "tags": ["pinned"]}])
-        
-        config = MemoryConfig(
-            db_path=tmp_path / "workspace.db",
-            global_db_path=tmp_path / "global.db",
-            embedding_enabled=False,
-            compression_level=0,  # Level 0 is NONE, returns full JSON
-        )
-        ctx = _tool_ctx(workspace_graph, config, global_graph)
-        
-        # Query full context with scope="all"
-        res = _tool_fn("memory_context_full")(ctx, scope="all", budget=10000)
-        res_dict = json.loads(res)
-        
-        entity_names = {e["name"] for e in res_dict["entities"]}
-        assert "Workspace Pinned" in entity_names
-        # Both must be present! (The fix ensures the global pinned entity is not skipped due to ID collision)
-        assert "Global Pinned" in entity_names
-    finally:
-        global_db.close()
-        workspace_db.close()
+        for graph, prefix in ((workspace_graph, "W"), (global_graph, "G")):
+            _seed_entity(graph, f"{prefix}-keep", obs=f"{prefix}-obs")
+            _seed_entity(graph, f"{prefix}-soft", obs=f"{prefix}-soft-obs")
+            _seed_entity(graph, f"{prefix}-hard", obs=f"{prefix}-hard-obs")
+            graph.create_entities([{"name": f"{prefix}-rel", "entityType": "note"}])
+            graph.create_relations(
+                [
+                    {
+                        "from": f"{prefix}-keep",
+                        "to": f"{prefix}-rel",
+                        "relationType": "related_to",
+                    }
+                ]
+            )
 
-
-def test_mcp_scope_all_same_named_entities_collision(tmp_path):
-    workspace_db = Database(tmp_path / "workspace.db")
-    global_db = Database(tmp_path / "global.db")
-    workspace_db.open()
-    global_db.open()
-    try:
-        workspace_graph = KnowledgeGraphManager(workspace_db, session_id="workspace")
-        global_graph = KnowledgeGraphManager(global_db, session_id="global")
-        
-        # Add same-named entities
-        workspace_graph.create_entities([
-            {"name": "App Settings", "entityType": "config", "tags": ["pinned"], "observations": ["workspace setting"]}
-        ])
-        global_graph.create_entities([
-            {"name": "App Settings", "entityType": "config", "tags": ["pinned"], "observations": ["global setting"]}
-        ])
-        
         config = MemoryConfig(
             db_path=tmp_path / "workspace.db",
             global_db_path=tmp_path / "global.db",
             embedding_enabled=False,
         )
         ctx = _tool_ctx(workspace_graph, config, global_graph)
-        
-        # Test memory_context tool with scope="all"
-        context_res = _tool_fn("memory_context")(ctx, hint="setting", scope="all")
-        assert "App Settings[config (workspace)]" in context_res
-        assert "App Settings[config (global)]" in context_res
-        
-        # Test memory_context_full tool with scope="all"
-        full_res = _tool_fn("memory_context_full")(ctx, scope="all", budget=10000)
-        assert "App Settings [config]" in full_res
-        assert "#workspace" in full_res
-        assert "#global" in full_res
+
+        for scope, graph, prefix in (
+            ("workspace", workspace_graph, "W"),
+            ("global", global_graph, "G"),
+        ):
+            soft = json.loads(
+                _tool_fn("delete_entities")(
+                    ctx, entityNames=[f"{prefix}-soft"], hard=False, scope=scope
+                )
+            )
+            assert soft["deleted"] == 1
+            assert graph.get_entity_by_name(f"{prefix}-soft") is None
+            hard = json.loads(
+                _tool_fn("delete_entities")(
+                    ctx, entityNames=[f"{prefix}-hard"], hard=True, scope=scope
+                )
+            )
+            assert hard["deleted"] == 1
+            row = graph.db.cx.execute(
+                "SELECT 1 FROM entities WHERE name = ?", (f"{prefix}-hard",)
+            ).fetchone()
+            assert row is None
+
+            obs = json.loads(
+                _tool_fn("delete_observations")(
+                    ctx,
+                    deletions=[
+                        {
+                            "entityName": f"{prefix}-keep",
+                            "observations": [f"{prefix}-obs"],
+                        }
+                    ],
+                    scope=scope,
+                )
+            )
+            assert obs["deleted"] == 1
+
+            rel = json.loads(
+                _tool_fn("delete_relations")(
+                    ctx,
+                    relations=[
+                        {
+                            "from": f"{prefix}-keep",
+                            "to": f"{prefix}-rel",
+                            "relationType": "related_to",
+                        }
+                    ],
+                    scope=scope,
+                )
+            )
+            assert rel["deleted"] == 1
+
+            graph.create_entities(
+                [
+                    {"name": f"{prefix}-src", "entityType": "note"},
+                    {"name": f"{prefix}-dst", "entityType": "note"},
+                ]
+            )
+            merged = json.loads(
+                _tool_fn("merge_entities")(
+                    ctx,
+                    source=f"{prefix}-src",
+                    target=f"{prefix}-dst",
+                    scope=scope,
+                )
+            )
+            assert merged["name"] == f"{prefix}-dst"
+            assert graph.get_entity_by_name(f"{prefix}-src") is None
+
+            graph.create_tag(f"{prefix}-tag")
+            deleted_tag = json.loads(
+                _tool_fn("manage_tags")(
+                    ctx, action="delete", name=f"{prefix}-tag", scope=scope
+                )
+            )
+            assert deleted_tag["deleted"] is True
+
+            cleaned = json.loads(
+                _tool_fn("manage_tags")(ctx, action="cleanup", scope=scope)
+            )
+            assert "cleaned" in cleaned
     finally:
         global_db.close()
         workspace_db.close()

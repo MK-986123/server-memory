@@ -2,6 +2,8 @@
 
 import math
 import struct
+import threading
+import time
 from unittest.mock import patch
 
 
@@ -88,3 +90,41 @@ def test_bytes_to_floats():
     assert len(result) == 3
     for a, b in zip(result, floats):
         assert abs(a - b) < 1e-6
+
+
+def test_timed_out_embedding_does_not_block_the_next_request(monkeypatch):
+    from server_memory.embeddings import EmbeddingEngine
+
+    engine = EmbeddingEngine()
+
+    def embed(text: str):
+        if text == "slow":
+            time.sleep(0.2)
+        return b"ok"
+
+    monkeypatch.setattr(engine, "embed_text", embed)
+    value, timed_out = engine.embed_text_with_timeout("slow", 0.01)
+    started = time.monotonic()
+    next_value, next_timed_out = engine.embed_text_with_timeout("fast", 0.1)
+
+    assert value is None and timed_out
+    assert next_value == b"ok" and not next_timed_out
+    assert time.monotonic() - started < 0.08
+
+
+def test_repeated_embedding_timeouts_use_at_most_two_workers(monkeypatch):
+    from server_memory.embeddings import EmbeddingEngine
+
+    engine = EmbeddingEngine()
+    monkeypatch.setattr(engine, "embed_text", lambda _text: time.sleep(0.15))
+
+    for index in range(8):
+        value, timed_out = engine.embed_text_with_timeout(str(index), 0.005)
+        assert value is None and timed_out
+
+    workers = [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("server-memory-embedding")
+    ]
+    assert len(workers) <= 2

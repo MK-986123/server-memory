@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .db import Database
-from .embeddings import EmbeddingEngine
+from .embeddings import EmbeddingEngine, embedding_bucket_probes, embedding_buckets
 from .models import (
     PROTECTED_OBS_TYPES,
     ActivityEntry,
@@ -28,10 +28,26 @@ logger = logging.getLogger(__name__)
 
 _embedding_backfill_lock = threading.Lock()
 _active_embedding_backfills: set[tuple[str, str]] = set()
+MAX_ENTITY_EMBEDDING_CANDIDATES = 1_000
+MAX_OBSERVATION_EMBEDDING_CANDIDATES = 4_000
+USE_EMBEDDING_BUCKET_FILTER = True
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _embedding_bucket_filter(alias: str, embedding: bytes) -> tuple[str, list[int]]:
+    """Build a bounded multi-probe LSH predicate and its parameters."""
+    if not USE_EMBEDDING_BUCKET_FILTER:
+        return "1", []
+    clauses: list[str] = []
+    params: list[int] = []
+    for index, probes in enumerate(embedding_bucket_probes(embedding)):
+        placeholders = ",".join("?" for _ in probes)
+        clauses.append(f"{alias}.bucket{index} IN ({placeholders})")
+        params.extend(probes)
+    return "(" + " OR ".join(clauses) + ")", params
 
 
 class KnowledgeGraphManager:
@@ -174,7 +190,16 @@ class KnowledgeGraphManager:
                 except sqlite3.IntegrityError:
                     cx.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     cx.execute(f"RELEASE SAVEPOINT {savepoint}")
-                    # Duplicate name — skip
+                    deleted = cx.execute(
+                        "SELECT id FROM entities WHERE name = ? AND deleted_at IS NOT NULL",
+                        (name,),
+                    ).fetchone()
+                    if deleted is not None:
+                        raise ValueError(
+                            f"Entity '{name}' exists but is soft-deleted; "
+                            "restore it with restore_entities or hard-delete it before recreating"
+                        ) from None
+                    # Active duplicate name — skip (legacy create_entities behavior)
                     continue
                 except Exception:
                     cx.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -245,6 +270,17 @@ class KnowledgeGraphManager:
                             (eid, eid),
                         )
         return count
+
+    def list_deleted_entities(self, limit: int = 100) -> list[Entity]:
+        """List recoverable soft-deleted entities, newest deletions first."""
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        rows = self.db.cx.execute(
+            "SELECT id FROM entities WHERE deleted_at IS NOT NULL "
+            "ORDER BY deleted_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [entity for row in rows if (entity := self._load_entity(row["id"])) is not None]
 
     # ------------------------------------------------------------------
     # Relation CRUD
@@ -404,8 +440,9 @@ class KnowledgeGraphManager:
                     obs_rows = cx.execute(
                         "SELECT oe.embedding FROM observation_embeddings oe "
                         "JOIN observations o ON o.id = oe.observation_id "
-                        "WHERE o.entity_id = ? AND o.deleted_at IS NULL",
-                        (eid,),
+                        "WHERE o.entity_id = ? AND o.deleted_at IS NULL "
+                        "AND oe.model_name = ?",
+                        (eid, self.embedding_engine.model_name),
                     ).fetchall()
                     existing_embeddings = [r["embedding"] for r in obs_rows]
 
@@ -662,6 +699,8 @@ class KnowledgeGraphManager:
     ) -> KnowledgeGraph:
         """Hybrid search: FTS5 + optional embedding-based semantic search."""
         cx = self.db.cx
+        sql_limit = limit if limit > 0 else -1
+        self.last_search_diagnostics: list[str] = []
         query_norm = self._normalize_memory_text(query)
 
         # --- FTS5 path (keyword search) ---
@@ -679,13 +718,14 @@ class KnowledgeGraphManager:
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (fts_query, limit),
+                (fts_query, sql_limit),
             ).fetchall()
             for row in rows:
                 # BM25 rank is negative (lower=better), normalize later
                 fts_scores[row["id"]] = row["rank"]
-        except Exception:
-            pass
+        except sqlite3.OperationalError as exc:
+            self.last_search_diagnostics.append("entity_fts_fallback")
+            logger.warning("Entity FTS unavailable; using fallback retrieval: %s", exc)
 
         if query_norm:
             exact_name_rows = cx.execute(
@@ -694,25 +734,29 @@ class KnowledgeGraphManager:
             ).fetchall()
             exact_name_ids = {row["id"] for row in exact_name_rows}
 
-        # Search observation content
+        # Search observation content (only for active parent entities)
         try:
             rows = cx.execute(
                 """
                 SELECT o.entity_id, rank FROM fts_observations fo
                 JOIN observations o ON o.id = fo.rowid
-                WHERE fts_observations MATCH ? AND o.deleted_at IS NULL
+                JOIN entities e ON e.id = o.entity_id
+                WHERE fts_observations MATCH ?
+                  AND o.deleted_at IS NULL
+                  AND e.deleted_at IS NULL
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (fts_query, limit),
+                (fts_query, sql_limit),
             ).fetchall()
             for row in rows:
                 eid = row["entity_id"]
                 # Keep best (most negative) rank per entity
                 if eid not in fts_scores or row["rank"] < fts_scores[eid]:
                     fts_scores[eid] = row["rank"]
-        except Exception:
-            pass
+        except sqlite3.OperationalError as exc:
+            self.last_search_diagnostics.append("observation_fts_fallback")
+            logger.warning("Observation FTS unavailable; using fallback retrieval: %s", exc)
 
         # --- Embedding path (semantic search) ---
         embedding_scores: dict[int, float] = {}
@@ -720,27 +764,53 @@ class KnowledgeGraphManager:
             self._ensure_embeddings()
             query_emb = self.embedding_engine.embed_text(query)
             if query_emb:
+                entity_bucket_sql, entity_bucket_params = _embedding_bucket_filter(
+                    "ee", query_emb
+                )
                 # Score entities by embedding similarity
                 emb_rows = cx.execute(
-                    """
+                    f"""
                     SELECT ee.entity_id, ee.embedding FROM entity_embeddings ee
                     JOIN entities e ON e.id = ee.entity_id
                     WHERE e.deleted_at IS NULL
-                    """
+                      AND ee.model_name = ? AND ee.dimension = ?
+                      AND {entity_bucket_sql}
+                    ORDER BY ee.entity_id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        self.embedding_engine.model_name,
+                        len(query_emb) // 4,
+                        *entity_bucket_params,
+                        MAX_ENTITY_EMBEDDING_CANDIDATES,
+                    ),
                 ).fetchall()
                 for er in emb_rows:
                     sim = self.embedding_engine.cosine_similarity(query_emb, er["embedding"])
                     embedding_scores[er["entity_id"]] = max(
                         embedding_scores.get(er["entity_id"], 0.0), sim
                     )
-                # Also score via observation embeddings
+                # Also score via observation embeddings for active entities only
+                obs_bucket_sql, obs_bucket_params = _embedding_bucket_filter("oe", query_emb)
                 obs_emb_rows = cx.execute(
-                    """
+                    f"""
                     SELECT oe.observation_id, oe.embedding, o.entity_id
                     FROM observation_embeddings oe
                     JOIN observations o ON o.id = oe.observation_id
+                    JOIN entities e ON e.id = o.entity_id
                     WHERE o.deleted_at IS NULL
-                    """
+                      AND e.deleted_at IS NULL
+                      AND oe.model_name = ? AND oe.dimension = ?
+                      AND {obs_bucket_sql}
+                    ORDER BY oe.observation_id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        self.embedding_engine.model_name,
+                        len(query_emb) // 4,
+                        *obs_bucket_params,
+                        MAX_OBSERVATION_EMBEDDING_CANDIDATES,
+                    ),
                 ).fetchall()
                 for oer in obs_emb_rows:
                     sim = self.embedding_engine.cosine_similarity(query_emb, oer["embedding"])
@@ -753,7 +823,7 @@ class KnowledgeGraphManager:
 
         # Fuzzy fallback if no results from either path
         if not all_eids:
-            ordered_eids = self._fuzzy_search(query, limit)
+            ordered_eids = self._fuzzy_search(query, sql_limit)
             all_eids = set(ordered_eids)
 
         if all_eids and (fts_scores or embedding_scores):
@@ -797,7 +867,7 @@ class KnowledgeGraphManager:
                 scored.append((eid, hybrid))
 
             scored.sort(key=lambda x: x[1], reverse=True)
-            ordered_eids = [eid for eid, _ in scored[:limit]]
+            ordered_eids = [eid for eid, _ in (scored[:limit] if limit > 0 else scored)]
             all_eids = set(ordered_eids)
         elif all_eids and not ordered_eids:
             ordered_eids = list(all_eids)
@@ -1212,8 +1282,9 @@ class KnowledgeGraphManager:
             ).fetchall()
             for row in rows:
                 fts_scores[row["id"]] = row["rank"]
-        except Exception:
-            pass
+        except sqlite3.OperationalError as exc:
+            self.last_search_diagnostics = ["context_entity_fts_fallback"]
+            logger.warning("Context entity FTS unavailable; using fallback retrieval: %s", exc)
 
         try:
             rows = cx.execute(
@@ -1233,8 +1304,11 @@ class KnowledgeGraphManager:
                 eid = row["entity_id"]
                 if eid not in fts_scores or row["rank"] < fts_scores[eid]:
                     fts_scores[eid] = row["rank"]
-        except Exception:
-            pass
+        except sqlite3.OperationalError as exc:
+            diagnostics = getattr(self, "last_search_diagnostics", [])
+            diagnostics.append("context_observation_fts_fallback")
+            self.last_search_diagnostics = diagnostics
+            logger.warning("Context observation FTS unavailable; using fallback retrieval: %s", exc)
 
         activity_scores = self._activity_scores_for_hint(query_tokens, query_norm, project=project)
 
@@ -1243,14 +1317,27 @@ class KnowledgeGraphManager:
             self._ensure_embeddings()
             query_embedding = self.embedding_engine.embed_text(hint)
             if query_embedding:
+                entity_bucket_sql, entity_bucket_params = _embedding_bucket_filter(
+                    "ee", query_embedding
+                )
                 entity_rows = cx.execute(
                     f"""
                     SELECT ee.entity_id, ee.embedding
                     FROM entity_embeddings ee
                     JOIN entities e ON e.id = ee.entity_id
                     WHERE e.deleted_at IS NULL{project_clause}
+                      AND ee.model_name = ? AND ee.dimension = ?
+                      AND {entity_bucket_sql}
+                    ORDER BY ee.entity_id DESC
+                    LIMIT ?
                     """,
-                    project_params,
+                    (
+                        *project_params,
+                        self.embedding_engine.model_name,
+                        len(query_embedding) // 4,
+                        *entity_bucket_params,
+                        MAX_ENTITY_EMBEDDING_CANDIDATES,
+                    ),
                 ).fetchall()
                 for row in entity_rows:
                     sim = self.embedding_engine.cosine_similarity(query_embedding, row["embedding"])
@@ -1259,6 +1346,9 @@ class KnowledgeGraphManager:
                             semantic_scores.get(row["entity_id"], 0.0), sim
                         )
 
+                obs_bucket_sql, obs_bucket_params = _embedding_bucket_filter(
+                    "oe", query_embedding
+                )
                 obs_rows = cx.execute(
                     f"""
                     SELECT o.entity_id, oe.embedding
@@ -1266,8 +1356,18 @@ class KnowledgeGraphManager:
                     JOIN observations o ON o.id = oe.observation_id
                     JOIN entities e ON e.id = o.entity_id
                     WHERE o.deleted_at IS NULL AND e.deleted_at IS NULL{project_clause}
+                      AND oe.model_name = ? AND oe.dimension = ?
+                      AND {obs_bucket_sql}
+                    ORDER BY oe.observation_id DESC
+                    LIMIT ?
                     """,
-                    project_params,
+                    (
+                        *project_params,
+                        self.embedding_engine.model_name,
+                        len(query_embedding) // 4,
+                        *obs_bucket_params,
+                        MAX_OBSERVATION_EMBEDDING_CANDIDATES,
+                    ),
                 ).fetchall()
                 for row in obs_rows:
                     sim = self.embedding_engine.cosine_similarity(query_embedding, row["embedding"])
@@ -2245,9 +2345,16 @@ class KnowledgeGraphManager:
             if similarity > 0.1:
                 best_scores[row["id"]] = similarity
 
-        # Also score observation content (Limit fallback scan)
+        # Also score observation content for active entities only (limit fallback scan)
         obs_rows = cx.execute(
-            "SELECT entity_id, content FROM observations WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 10000"
+            """
+            SELECT o.entity_id, o.content
+            FROM observations o
+            JOIN entities e ON e.id = o.entity_id
+            WHERE o.deleted_at IS NULL AND e.deleted_at IS NULL
+            ORDER BY o.updated_at DESC
+            LIMIT 10000
+            """
         ).fetchall()
         for row in obs_rows:
             text = row["content"].lower()
@@ -2262,7 +2369,7 @@ class KnowledgeGraphManager:
                 best_scores[eid] = max(best_scores.get(eid, 0.0), similarity)
 
         scored = sorted(best_scores.items(), key=lambda x: x[1], reverse=True)
-        return [eid for eid, _ in scored[:limit]]
+        return [eid for eid, _ in (scored[:limit] if limit > 0 else scored)]
 
     @staticmethod
     def _trigrams(text: str) -> set[str]:
@@ -2401,9 +2508,12 @@ class KnowledgeGraphManager:
             text = f"{name} {entity_type}".strip()
             emb = self.embedding_engine.embed_text(text)
         if emb:
+            buckets = embedding_buckets(emb)
             self.db.cx.execute(
-                "INSERT OR REPLACE INTO entity_embeddings (entity_id, embedding, model_name) VALUES (?, ?, ?)",
-                (entity_id, emb, self.embedding_engine.model_name),
+                "INSERT OR REPLACE INTO entity_embeddings "
+                "(entity_id, embedding, model_name, dimension, bucket0, bucket1, bucket2, bucket3) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (entity_id, emb, self.embedding_engine.model_name, len(emb) // 4, *buckets),
             )
 
     def _embed_observation(
@@ -2420,9 +2530,12 @@ class KnowledgeGraphManager:
         if emb is None and allow_fallback:
             emb = self.embedding_engine.embed_text(content)
         if emb:
+            buckets = embedding_buckets(emb)
             self.db.cx.execute(
-                "INSERT OR REPLACE INTO observation_embeddings (observation_id, embedding, model_name) VALUES (?, ?, ?)",
-                (observation_id, emb, self.embedding_engine.model_name),
+                "INSERT OR REPLACE INTO observation_embeddings "
+                "(observation_id, embedding, model_name, dimension, "
+                "bucket0, bucket1, bucket2, bucket3) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (observation_id, emb, self.embedding_engine.model_name, len(emb) // 4, *buckets),
             )
 
     def _ensure_embeddings(self) -> None:
@@ -2511,20 +2624,22 @@ class KnowledgeGraphManager:
             missing_entities = cx.execute(
                 """
                 SELECT e.id, e.name, e.entity_type FROM entities e
-                LEFT JOIN entity_embeddings ee ON ee.entity_id = e.id
+                LEFT JOIN entity_embeddings ee
+                  ON ee.entity_id = e.id AND ee.model_name = ?
                 WHERE e.deleted_at IS NULL AND ee.entity_id IS NULL
                 LIMIT ?
                 """,
-                (batch_size,),
+                (self.embedding_engine.model_name, batch_size),
             ).fetchall()
             missing_obs = cx.execute(
                 """
                 SELECT o.id, o.content FROM observations o
-                LEFT JOIN observation_embeddings oe ON oe.observation_id = o.id
+                LEFT JOIN observation_embeddings oe
+                  ON oe.observation_id = o.id AND oe.model_name = ?
                 WHERE o.deleted_at IS NULL AND oe.observation_id IS NULL
                 LIMIT ?
                 """,
-                (batch_size,),
+                (self.embedding_engine.model_name, batch_size),
             ).fetchall()
 
             if not missing_entities and not missing_obs:
@@ -2559,14 +2674,26 @@ class KnowledgeGraphManager:
 
             with self.db.transaction() as cx:
                 for entity_id, emb in entity_embeddings:
+                    buckets = embedding_buckets(emb)
                     cx.execute(
-                        "INSERT OR REPLACE INTO entity_embeddings (entity_id, embedding, model_name) VALUES (?, ?, ?)",
-                        (entity_id, emb, self.embedding_engine.model_name),
+                        "INSERT OR REPLACE INTO entity_embeddings "
+                        "(entity_id, embedding, model_name, dimension, "
+                        "bucket0, bucket1, bucket2, bucket3) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (entity_id, emb, self.embedding_engine.model_name, len(emb) // 4, *buckets),
                     )
                 for observation_id, emb in observation_embeddings:
+                    buckets = embedding_buckets(emb)
                     cx.execute(
-                        "INSERT OR REPLACE INTO observation_embeddings (observation_id, embedding, model_name) VALUES (?, ?, ?)",
-                        (observation_id, emb, self.embedding_engine.model_name),
+                        "INSERT OR REPLACE INTO observation_embeddings "
+                        "(observation_id, embedding, model_name, dimension, "
+                        "bucket0, bucket1, bucket2, bucket3) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            observation_id,
+                            emb,
+                            self.embedding_engine.model_name,
+                            len(emb) // 4,
+                            *buckets,
+                        ),
                     )
             total_inserted += len(entity_embeddings) + len(observation_embeddings)
 

@@ -1,0 +1,127 @@
+tasks:
+  # --- LOW ---
+  - id: low_repr
+    tier: low
+    prompt: "Add a __repr__ to the Entity dataclass in src/server_memory/models.py
+      returning Entity(name='x', type='y', observations=N)."
+    verify: grep
+    verify_pattern: "def __repr__"
+    verify_file: src/server_memory/models.py
+
+  - id: low_validate
+    tier: low
+    prompt: "Add a static method validate_entity_name(name: str) -> str to
+      KnowledgeGraphManager in src/server_memory/graph.py. Strip whitespace,
+      raise ValueError if empty/whitespace-only or >200 chars, return stripped
+      name."
+    verify: grep
+    verify_pattern: "def validate_entity_name"
+    verify_file: src/server_memory/graph.py
+
+  # --- MID ---
+  - id: mid_rename
+    tier: mid
+    prompt: "Add rename_entity(self, old_name, new_name) -> bool to
+      KnowledgeGraphManager in src/server_memory/graph.py. Return False if old
+      not found, raise ValueError if new exists, update name+updated_at, use
+      self.db.transaction()."
+    verify: pytest
+    verify_test: |
+      import sys, os
+      sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+      from server_memory.db import Database
+      from server_memory.graph import KnowledgeGraphManager
+      def test_rename():
+          db = Database(":memory:")
+          db.open()
+          mgr = KnowledgeGraphManager(db, session_id="test")
+          mgr.create_entities([{"name": "alpha", "entityType": "test"}])
+          assert mgr.rename_entity("alpha", "beta") == True
+          assert mgr.get_entity_by_name("beta") is not None
+          assert mgr.get_entity_by_name("alpha") is None
+          assert mgr.rename_entity("nonexistent", "x") == False
+          db.close()
+
+  - id: mid_export
+    tier: mid
+    prompt: "Create src/server_memory/export.py with export_graph_json(db_path: str)
+      -> str. Open DB, read non-deleted entities with observations and
+      relations, return JSON: {entities:[{name,type,observations:[str]}],
+      relations:[{from,to,type}]}."
+    verify: pytest
+    verify_test: |
+      import sys, os, json, tempfile
+      sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+      from server_memory.db import Database
+      from server_memory.graph import KnowledgeGraphManager
+      from server_memory.export import export_graph_json
+      def test_export():
+          db_path = tempfile.NamedTemporaryFile(suffix='.db', delete=False).name
+          db = Database(db_path)
+          db.open()
+          mgr = KnowledgeGraphManager(db, session_id="test")
+          mgr.create_entities([{"name": "A", "entityType": "node", "observations": ["obs1"]}])
+          mgr.create_entities([{"name": "B", "entityType": "node"}])
+          mgr.create_relations([{"from": "A", "to": "B", "relationType": "links_to"}])
+          db.close()
+          result = json.loads(export_graph_json(db_path))
+          assert len(result["entities"]) == 2
+          assert len(result["relations"]) == 1
+          os.unlink(db_path)
+
+  # --- HIGH ---
+  - id: high_bulk_import
+    tier: high
+    prompt: "Create src/server_memory/bulk_import.py with bulk_import_jsonl(db_path,
+      jsonl_path) -> dict. Read JSONL lines:
+      {type:entity,name,entityType,observations:[]} or
+      {type:relation,from,to,relationType}. Validate, dedup by name, return
+      {entities_created,relations_created,skipped,errors:[]}. Use project's
+      Database/KnowledgeGraphManager."
+    verify: pytest
+    verify_test: |
+      import sys, os, json, tempfile
+      sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+      from server_memory.bulk_import import bulk_import_jsonl
+      def test_bulk():
+          lines = [
+              json.dumps({"type":"entity","name":"X","entityType":"test","observations":["o1"]}),
+              json.dumps({"type":"entity","name":"Y","entityType":"test","observations":[]}),
+              json.dumps({"type":"relation","from":"X","to":"Y","relationType":"knows"}),
+              json.dumps({"type":"entity","name":"X","entityType":"test","observations":["dup"]}),
+              "invalid json {{{",
+          ]
+          with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+              f.write('\n'.join(lines))
+              path = f.name
+          db_path = tempfile.NamedTemporaryFile(suffix='.db', delete=False).name
+          result = bulk_import_jsonl(db_path, path)
+          assert result["entities_created"] == 2
+          assert result["relations_created"] == 1
+          assert result["skipped"] >= 1
+          os.unlink(path)
+          os.unlink(db_path)
+
+  - id: high_prune
+    tier: high
+    prompt: "Add prune_disconnected(self, min_subgraph_size=2) -> int to
+      KnowledgeGraphManager in src/server_memory/graph.py. Find connected
+      components via BFS, soft-delete entities in components smaller than
+      min_subgraph_size, use self.db.transaction(), return count pruned."
+    verify: pytest
+    verify_test: |
+      import sys, os
+      sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+      from server_memory.db import Database
+      from server_memory.graph import KnowledgeGraphManager
+      def test_prune():
+          db = Database(":memory:")
+          db.open()
+          mgr = KnowledgeGraphManager(db, session_id="test")
+          mgr.create_entities([{"name": n, "entityType": "t"} for n in ["A","B","C","D","E"]])
+          mgr.create_relations([{"from":"A","to":"B","relationType":"r"},{"from":"B","to":"C","relationType":"r"}])
+          pruned = mgr.prune_disconnected(min_subgraph_size=2)
+          assert pruned == 2
+          assert mgr.get_entity_by_name("A") is not None
+          assert mgr.get_entity_by_name("D") is None
+          db.close()

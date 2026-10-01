@@ -41,6 +41,12 @@ Install optional embeddings only when the task requires them:
 python -m pip install -e ".[dev,embeddings]"
 ```
 
+Exact token counting is optional. Core install uses approximate character-based budgets; install the `tokenizer` extra when tiktoken-backed counts are needed:
+
+```bash
+python -m pip install -e ".[dev,tokenizer]"
+```
+
 ## Safe test environment
 
 Never use a real user memory database for tests or exploratory commands.
@@ -68,6 +74,10 @@ Do not commit `.tmp`, SQLite databases, exports, backups, token files, model cac
 - Preserve public tool names, parameter shapes, scope semantics, and JSON-RPC behavior unless the task explicitly requires a breaking change.
 - Keep stdio stdout protocol-clean. Send diagnostics to stderr or logging.
 - Keep destructive operations explicit and scoped. Do not weaken rejection of `scope="all"` for destructive tools.
+- Prefer soft-delete defaults for entities; preserve `list_deleted_entities` and `restore_entities`. Hard delete must remain explicit.
+- Soft-deleted entities and their observations must not consume active FTS/embedding candidate slots.
+- Schema migrations run on database open. Keep DDL and migration order safe for existing schema v4 production databases; never create indexes on columns that migrations have not added yet. First open after upgrade may be slower on large embedding tables.
+- Keep default SQLite connection/busy/write timeouts conservative (30s) unless an operator sets `MEMORY_WRITE_TIMEOUT_MS` explicitly.
 - Do not add performance claims without reproducible raw results.
 
 ## Required validation

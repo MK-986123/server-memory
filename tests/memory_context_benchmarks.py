@@ -251,6 +251,86 @@ def _setup_duplicate_suppression(graph: KnowledgeGraphManager) -> None:
     )
 
 
+def _setup_contradiction_resolution(graph: KnowledgeGraphManager) -> None:
+    graph.create_entities(
+        [
+            {"name": "Current Deployment Policy", "entityType": "config"},
+            {"name": "Superseded Deployment Note", "entityType": "note"},
+        ]
+    )
+    graph.add_observations(
+        [
+            {
+                "entityName": "Current Deployment Policy",
+                "contents": ["deployment approval requires two reviewers"],
+                "confidence": 1.0,
+                "importance": 1.0,
+                "obs_type": "config",
+            },
+            {
+                "entityName": "Superseded Deployment Note",
+                "contents": ["deployment approval requires one reviewer"],
+                "confidence": 0.1,
+                "importance": 0.1,
+            },
+        ]
+    )
+
+
+def _setup_paraphrase(graph: KnowledgeGraphManager) -> None:
+    graph.create_entities(
+        [
+            {
+                "name": "Credential Rotation Runbook",
+                "entityType": "doc",
+                "observations": ["procedure for rotating service credentials safely"],
+            },
+            {
+                "name": "Unrelated Credentials Note",
+                "entityType": "note",
+                "observations": ["credentials were mentioned during planning"],
+            },
+        ]
+    )
+
+
+def _setup_multilingual(graph: KnowledgeGraphManager) -> None:
+    graph.create_entities(
+        [
+            {
+                "name": "Guía de Rotación",
+                "entityType": "doc",
+                "observations": ["rotación de claves de producción cada noventa días"],
+            },
+            {
+                "name": "Notas Generales",
+                "entityType": "note",
+                "observations": ["documentación general del equipo"],
+            },
+        ]
+    )
+
+
+def _setup_noisy_scale(graph: KnowledgeGraphManager) -> None:
+    graph.create_entities(
+        [
+            {
+                "name": f"Noise {index:04d}",
+                "entityType": "note",
+                "observations": [f"routine background record {index:04d}"],
+            }
+            for index in range(500)
+        ]
+        + [
+            {
+                "name": "Canonical Quasar Runbook",
+                "entityType": "doc",
+                "observations": ["quasar-needle recovery procedure"],
+            }
+        ]
+    )
+
+
 BENCHMARK_SCENARIOS: tuple[MemoryContextScenario, ...] = (
     MemoryContextScenario(
         name="exact_entity_name_lookup",
@@ -321,6 +401,34 @@ BENCHMARK_SCENARIOS: tuple[MemoryContextScenario, ...] = (
         setup=_setup_duplicate_suppression,
         expected_top=("Auth Canonical", "Auth Duplicate"),
         expected_top3=("Auth Canonical", "Auth Duplicate"),
+    ),
+    MemoryContextScenario(
+        name="current_fact_beats_contradiction",
+        hint="deployment approval reviewers",
+        setup=_setup_contradiction_resolution,
+        expected_top=("Current Deployment Policy",),
+        expected_top3=("Current Deployment Policy",),
+    ),
+    MemoryContextScenario(
+        name="paraphrased_procedure_is_retrieved",
+        hint="how to rotate service credentials",
+        setup=_setup_paraphrase,
+        expected_top=("Credential Rotation Runbook",),
+        expected_top3=("Credential Rotation Runbook",),
+    ),
+    MemoryContextScenario(
+        name="multilingual_lexical_retrieval",
+        hint="rotación claves producción",
+        setup=_setup_multilingual,
+        expected_top=("Guía de Rotación",),
+        expected_top3=("Guía de Rotación",),
+    ),
+    MemoryContextScenario(
+        name="target_survives_noisy_scale",
+        hint="quasar-needle recovery",
+        setup=_setup_noisy_scale,
+        expected_top=("Canonical Quasar Runbook",),
+        expected_top3=("Canonical Quasar Runbook",),
     ),
 )
 

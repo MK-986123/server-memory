@@ -26,6 +26,12 @@ Optional embeddings:
 python -m pip install -e ".[dev,embeddings]"
 ```
 
+Optional local benchmark harness dependencies:
+
+```bash
+python -m pip install -e ".[dev,benchmark]"
+```
+
 Verify SQLite FTS5 support:
 
 ```bash

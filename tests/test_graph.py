@@ -121,9 +121,11 @@ def test_create_entities_skip_duplicates_releases_transaction_lock():
 
 
 def test_create_entities_raises_when_database_is_locked():
+    from server_memory.db import DatabaseBusyError
+
     db_path = Path(tempfile.mkdtemp()) / "memory.db"
 
-    blocked_db = Database(db_path)
+    blocked_db = Database(db_path, write_timeout_seconds=0.3)
     blocked_db.open()
     blocked_db.cx.execute("PRAGMA busy_timeout=50")
     locker = sqlite3.connect(db_path, check_same_thread=False)
@@ -133,8 +135,9 @@ def test_create_entities_raises_when_database_is_locked():
         try:
             blocked_graph.create_entities([{"name": "Blocked", "entityType": "note"}])
             assert False, "Expected create_entities to surface the lock error"
-        except sqlite3.OperationalError as exc:
-            assert "locked" in str(exc).lower()
+        except DatabaseBusyError as exc:
+            assert "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            assert exc.retryable is True
     finally:
         blocked_db.close()
         locker.rollback()
@@ -144,7 +147,8 @@ def test_create_entities_raises_when_database_is_locked():
 def test_create_entities_retries_until_lock_is_released():
     db_path = Path(tempfile.mkdtemp()) / "memory.db"
 
-    blocked_db = Database(db_path)
+    # Default write timeout is 30s; release well inside that window.
+    blocked_db = Database(db_path, write_timeout_seconds=5.0)
     blocked_db.open()
     blocked_db.cx.execute("PRAGMA busy_timeout=50")
     locker = sqlite3.connect(db_path, check_same_thread=False)
@@ -460,6 +464,24 @@ def test_soft_delete_entity(graph):
     assert any(e.name == "ToDelete" for e in kg.entities)
 
 
+def test_create_entities_rejects_soft_deleted_name_with_actionable_error(graph):
+    graph.create_entities([{"name": "Recycle", "entityType": "test"}])
+    graph.delete_entities(["Recycle"], hard=False)
+
+    try:
+        graph.create_entities([{"name": "Recycle", "entityType": "test"}])
+        assert False, "expected soft-deleted name to raise"
+    except ValueError as exc:
+        message = str(exc)
+        assert "soft-deleted" in message
+        assert "restore_entities" in message or "hard-delete" in message
+
+    # Active entity remains absent until restored; no silent skip.
+    assert graph.get_entity_by_name("Recycle") is None
+    assert graph.restore_entities(["Recycle"]) == 1
+    assert graph.get_entity_by_name("Recycle") is not None
+
+
 def test_hard_delete_entity(graph):
     graph.create_entities([{"name": "Gone", "entityType": "test"}])
     count = graph.delete_entities(["Gone"], hard=True)
@@ -475,6 +497,21 @@ def test_restore_entity(graph):
     assert count == 1
     kg = graph.read_graph()
     assert any(e.name == "Restore" for e in kg.entities)
+
+
+def test_list_deleted_entities_supports_recovery(graph):
+    graph.create_entities(
+        [
+            {"name": "Recover First", "entityType": "test"},
+            {"name": "Recover Second", "entityType": "test"},
+        ]
+    )
+    graph.delete_entities(["Recover First", "Recover Second"])
+
+    deleted = graph.list_deleted_entities(limit=10)
+
+    assert [entity.name for entity in deleted] == ["Recover Second", "Recover First"]
+    assert all(entity.deleted_at is not None for entity in deleted)
 
 
 def test_create_relations(graph):
